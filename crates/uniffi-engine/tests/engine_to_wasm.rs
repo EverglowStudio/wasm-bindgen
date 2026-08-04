@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -5,14 +6,14 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 use uniffi_js_abi::{
     assign_component_ids, assign_operation_ids, assign_type_ids, ArgumentDefinition, AsyncKind,
-    ComponentDefinition, ComponentKey, NamedTypeKind, OperationDefinition, OperationId,
-    OperationKind, OperationOwner, OperationSignature, OperationSourceKey, Ownership, ScalarType,
-    TypeDefinition, TypeSourceKey, ValueType,
+    ComponentDefinition, ComponentKey, EnumVariant, NamedTypeKind, OperationDefinition,
+    OperationId, OperationKind, OperationOwner, OperationSignature, OperationSourceKey, Ownership,
+    ScalarType, TypeDefinition, TypeSourceKey, ValueType,
 };
 use uniffi_js_engine_schema::{
-    BridgePlan, BridgePlanInput, CallbackCallStyle, CallbackContract, CallbackErrorStyle,
-    CallbackReentrancy, CallbackRetention, CallbackThreading, CallbackUseSite, Capability,
-    EngineCapabilities, EngineKind, PlannedOperation, ValuePath,
+    BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
+    CallbackThreading, CallbackUseSite, Capability, EngineCapabilities, EngineKind,
+    PlannedOperation, ValuePath,
 };
 use wasm_bindgen_cli_support::Bindgen;
 use wasm_bindgen_macro_support::ExpansionContext;
@@ -62,18 +63,57 @@ fn argument(name: &str, ty: ValueType) -> ArgumentDefinition {
     ArgumentDefinition::new(name, ty, Ownership::Owned).unwrap()
 }
 
+fn callback_method(
+    component: &ComponentKey,
+    callback_key: &TypeSourceKey,
+    name: &str,
+    async_kind: AsyncKind,
+    throws: Option<TypeSourceKey>,
+) -> OperationDefinition {
+    OperationDefinition::new(
+        OperationSourceKey::new(
+            component.clone(),
+            OperationOwner::Callback(callback_key.clone()),
+            OperationKind::CallbackMethod,
+            name,
+        )
+        .unwrap(),
+        name,
+        format!("fixture.TextCallback.{name}"),
+        format!("uniffi_fixture_text_callback_{name}"),
+        OperationSignature {
+            arguments: vec![argument("text", ValueType::Scalar(ScalarType::String))],
+            return_type: Some(ValueType::Scalar(ScalarType::String)),
+            async_kind,
+            throws,
+        },
+    )
+    .unwrap()
+}
+
 fn engine_plan() -> WasmEnginePlan {
     let component = ComponentKey::new("fixture").unwrap();
     let callback_key = TypeSourceKey::new(component.clone(), "TextCallback").unwrap();
+    let error_key = TypeSourceKey::new(component.clone(), "CallbackError").unwrap();
     let components =
         assign_component_ids([ComponentDefinition::new(component.clone(), "fixture").unwrap()])
             .unwrap();
-    let types = assign_type_ids([TypeDefinition::new(
-        callback_key.clone(),
-        "TextCallback",
-        NamedTypeKind::Callback,
-    )
-    .unwrap()])
+    let types = assign_type_ids([
+        TypeDefinition::new(
+            callback_key.clone(),
+            "TextCallback",
+            NamedTypeKind::Callback,
+        )
+        .unwrap(),
+        TypeDefinition::new(
+            error_key.clone(),
+            "CallbackError",
+            NamedTypeKind::Error {
+                variants: vec![EnumVariant::new("Rejected", vec![]).unwrap()],
+            },
+        )
+        .unwrap(),
+    ])
     .unwrap();
     let operations = assign_operation_ids([
         operation(
@@ -97,53 +137,90 @@ fn engine_plan() -> WasmEnginePlan {
             &component,
             "c_make_callback",
             vec![argument("prefix", ValueType::Scalar(ScalarType::String))],
-            ValueType::Named(callback_key),
+            ValueType::Named(callback_key.clone()),
             AsyncKind::Sync,
         ),
-        OperationDefinition::new(
-            OperationSourceKey::new(
-                component.clone(),
-                OperationOwner::Callback(
-                    TypeSourceKey::new(component.clone(), "TextCallback").unwrap(),
-                ),
-                OperationKind::CallbackMethod,
-                "call",
-            )
-            .unwrap(),
-            "call",
-            "fixture.TextCallback.call",
-            "uniffi_fixture_text_callback_call",
-            OperationSignature {
-                arguments: vec![argument("text", ValueType::Scalar(ScalarType::String))],
-                return_type: Some(ValueType::Scalar(ScalarType::String)),
-                async_kind: AsyncKind::Sync,
-                throws: None,
-            },
-        )
-        .unwrap(),
+        callback_method(
+            &component,
+            &callback_key,
+            "d_sync_infallible",
+            AsyncKind::Sync,
+            None,
+        ),
+        callback_method(
+            &component,
+            &callback_key,
+            "e_sync_fallible",
+            AsyncKind::Sync,
+            Some(error_key.clone()),
+        ),
+        callback_method(
+            &component,
+            &callback_key,
+            "f_async_infallible",
+            AsyncKind::Async,
+            None,
+        ),
+        callback_method(
+            &component,
+            &callback_key,
+            "g_async_fallible",
+            AsyncKind::Async,
+            Some(error_key),
+        ),
     ])
     .unwrap();
+    let callback_operations = operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.definition.source_key.owner(),
+                OperationOwner::Callback(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(callback_operations.len(), 4);
     assert_eq!(
-        operations
+        callback_operations
             .iter()
-            .map(|operation| operation.definition.public_name.as_str())
+            .map(|operation| {
+                (
+                    operation.definition.public_name.as_str(),
+                    operation.definition.signature.async_kind,
+                    operation.definition.signature.throws.is_some(),
+                )
+            })
             .collect::<Vec<_>>(),
-        ["a_roundtrip", "b_async_bytes", "c_make_callback", "call"]
+        [
+            ("d_sync_infallible", AsyncKind::Sync, false),
+            ("e_sync_fallible", AsyncKind::Sync, true),
+            ("f_async_infallible", AsyncKind::Async, false),
+            ("g_async_fallible", AsyncKind::Async, true),
+        ]
     );
+
+    let callback_type = types
+        .iter()
+        .find(|ty| ty.definition.source_key == callback_key)
+        .unwrap()
+        .id;
+    let operation_ids = operations
+        .iter()
+        .map(|operation| (operation.definition.public_name.clone(), operation.id))
+        .collect::<BTreeMap<_, _>>();
+    let operation_id = |name: &str| *operation_ids.get(name).unwrap();
 
     let bridge_plan = BridgePlan::build(BridgePlanInput {
         components,
         types,
         operations: operations.into_iter().map(PlannedOperation::new).collect(),
         callbacks: vec![CallbackUseSite {
-            operation_id: OperationId::new(2),
-            callback_type: uniffi_js_abi::TypeId::new(0),
+            operation_id: operation_id("c_make_callback"),
+            callback_type,
             path: ValuePath::return_value(),
             contract: CallbackContract {
                 retention: CallbackRetention::Retained,
                 threading: CallbackThreading::CallingThread,
-                call_style: CallbackCallStyle::Sync,
-                error_style: CallbackErrorStyle::Infallible,
                 reentrancy: CallbackReentrancy::Allowed,
             },
         }],
@@ -159,6 +236,9 @@ fn engine_plan() -> WasmEnginePlan {
                 Capability::Callback,
                 Capability::RetainedCallback,
                 Capability::CallbackReentrancy,
+                Capability::AsyncCallback,
+                Capability::FallibleCallback,
+                Capability::DeclaredError,
             ],
         )],
     })
@@ -183,7 +263,7 @@ fn engine_plan() -> WasmEnginePlan {
                 fallible: false,
             },
             WasmOperationPlan {
-                operation_id: OperationId::new(2),
+                operation_id: operation_id("c_make_callback"),
                 rust_call: RustPath::new(["fixture".to_owned(), "c_make_callback".to_owned()])
                     .unwrap(),
                 arguments: vec![WasmCarrier::String],
@@ -191,12 +271,36 @@ fn engine_plan() -> WasmEnginePlan {
                 fallible: false,
             },
             WasmOperationPlan {
-                operation_id: OperationId::new(3),
-                rust_call: RustPath::new(["fixture".to_owned(), "d_callback_method".to_owned()])
+                operation_id: operation_id("d_sync_infallible"),
+                rust_call: RustPath::new(["fixture".to_owned(), "d_sync_infallible".to_owned()])
                     .unwrap(),
                 arguments: vec![WasmCarrier::String],
                 return_carrier: Some(WasmCarrier::String),
                 fallible: false,
+            },
+            WasmOperationPlan {
+                operation_id: operation_id("e_sync_fallible"),
+                rust_call: RustPath::new(["fixture".to_owned(), "e_sync_fallible".to_owned()])
+                    .unwrap(),
+                arguments: vec![WasmCarrier::String],
+                return_carrier: Some(WasmCarrier::String),
+                fallible: true,
+            },
+            WasmOperationPlan {
+                operation_id: operation_id("f_async_infallible"),
+                rust_call: RustPath::new(["fixture".to_owned(), "f_async_infallible".to_owned()])
+                    .unwrap(),
+                arguments: vec![WasmCarrier::String],
+                return_carrier: Some(WasmCarrier::String),
+                fallible: false,
+            },
+            WasmOperationPlan {
+                operation_id: operation_id("g_async_fallible"),
+                rust_call: RustPath::new(["fixture".to_owned(), "g_async_fallible".to_owned()])
+                    .unwrap(),
+                arguments: vec![WasmCarrier::String],
+                return_carrier: Some(WasmCarrier::String),
+                fallible: true,
             },
         ],
     )
@@ -241,8 +345,28 @@ mod fixture {{
             .into_js_value()
     }}
 
-    pub fn d_callback_method(text: String) -> String {{
-        text
+    pub fn d_sync_infallible(text: String) -> String {{
+        format!("sync:{{text}}")
+    }}
+
+    pub fn e_sync_fallible(text: String) -> Result<String, JsValue> {{
+        if text == "reject" {{
+            Err(JsValue::from_str("sync callback rejected"))
+        }} else {{
+            Ok(format!("sync-fallible:{{text}}"))
+        }}
+    }}
+
+    pub async fn f_async_infallible(text: String) -> String {{
+        format!("async:{{text}}")
+    }}
+
+    pub async fn g_async_fallible(text: String) -> Result<String, JsValue> {{
+        if text == "reject" {{
+            Err(JsValue::from_str("async callback rejected"))
+        }} else {{
+            Ok(format!("async-fallible:{{text}}"))
+        }}
     }}
 }}
 
@@ -320,7 +444,15 @@ fn runtime_script(module_name: &str, web: bool) -> String {
 import assert from 'node:assert/strict';
 {imports}
 
-for (const raw of ['__uniffi_operation_0', '__uniffi_operation_1', '__uniffi_operation_2', '__uniffi_operation_3']) {{
+for (const raw of [
+    '__uniffi_operation_0',
+    '__uniffi_operation_1',
+    '__uniffi_operation_2',
+    '__uniffi_operation_3',
+    '__uniffi_operation_4',
+    '__uniffi_operation_5',
+    '__uniffi_operation_6',
+]) {{
     assert.equal(Object.hasOwn(api, raw), false);
 }}
 assert.equal(typeof api.{DEFAULT_BACKEND_FACTORY}, 'function');
@@ -328,7 +460,7 @@ const uniffiExports = Object.keys(api).filter((name) => name.includes('uniffi'))
 assert.deepEqual(uniffiExports, ['{DEFAULT_BACKEND_FACTORY}']);
 
 const backend = api.{DEFAULT_BACKEND_FACTORY}();
-assert.equal(backend.operationCount, 4);
+assert.equal(backend.operationCount, 7);
 assert.equal(backend.call(0, 'sum', new Uint8Array([1, 2, 3, 4])), 'sum:10');
 const pending = backend.call(1, 'bytes');
 assert.equal(typeof pending.then, 'function');
@@ -336,6 +468,12 @@ assert.deepEqual(Array.from(await pending), [98, 121, 116, 101, 115]);
 const callback = backend.call(2, 'prefix:');
 assert.equal(typeof callback, 'function');
 assert.equal(callback('value'), 'prefix:value');
+assert.equal(backend.call(3, 'value'), 'sync:value');
+assert.equal(backend.call(4, 'value'), 'sync-fallible:value');
+assert.throws(() => backend.call(4, 'reject'));
+assert.equal(await backend.call(5, 'value'), 'async:value');
+assert.equal(await backend.call(6, 'value'), 'async-fallible:value');
+await assert.rejects(backend.call(6, 'reject'));
 "#
     )
 }
@@ -397,6 +535,40 @@ fn generate_and_run_target(temp: &TempDir, plan: &WasmEnginePlan, wasm: &Path, t
 fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
     let temp = tempfile::tempdir().unwrap();
     let plan = engine_plan();
+
+    let context = ExpansionContext::new(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        FIXTURE_NAME,
+        "1.0.0",
+        Vec::<String>::new(),
+        "wasm32-unknown-unknown",
+    )
+    .unwrap();
+    let expanded = plan.expand(context).unwrap();
+    let tokens = |operation_id: u32| {
+        expanded
+            .iter()
+            .find(|operation| operation.operation_id == OperationId::new(operation_id))
+            .unwrap()
+            .tokens
+            .to_string()
+    };
+    let sync_infallible = tokens(3);
+    assert!(sync_infallible.contains("pub fn"));
+    assert!(!sync_infallible.contains("pub async fn"));
+    assert!(sync_infallible.contains("-> String {"));
+    assert!(!sync_infallible.contains("-> Result < String"));
+    let sync_fallible = tokens(4);
+    assert!(sync_fallible.contains("pub fn"));
+    assert!(sync_fallible.contains("-> Result < String"));
+    let async_infallible = tokens(5);
+    assert!(async_infallible.contains("pub async fn"));
+    assert!(async_infallible.contains("-> String {"));
+    assert!(!async_infallible.contains("-> Result < String"));
+    let async_fallible = tokens(6);
+    assert!(async_fallible.contains("pub async fn"));
+    assert!(async_fallible.contains("-> Result < String"));
+
     let wasm = build_fixture(&temp, &plan);
 
     for target in ["web", "bundler", "node"] {

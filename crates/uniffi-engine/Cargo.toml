@@ -11,8 +11,8 @@ rust-version = "1.86"
 [dependencies]
 proc-macro2 = "1.0"
 quote = "1.0"
-uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
-uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4", version = "=0.32.0" }
+uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "4361fc73c10e36bdfc3fd0438ed63d9f2e130cd4", version = "=0.32.0" }
 wasm-bindgen-cli-support = { path = "../cli-support", version = "=0.2.126" }
 wasm-bindgen-macro-support = { path = "../macro-support", version = "=0.2.126" }
 

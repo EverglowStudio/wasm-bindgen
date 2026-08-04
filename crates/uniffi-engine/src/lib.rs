@@ -1,22 +1,25 @@
-//! Programmatic wasm-bindgen frontend for UniFFI's validated bridge plan.
+//! Programmatic wasm-bindgen lowering for UniFFI's JavaScript backend.
 //!
-//! This crate accepts only the engine-neutral, in-memory [`BridgePlan`] and a
-//! structured wasm carrier plan.  It does not parse UniFFI component metadata,
-//! scan or rewrite Rust source, invoke an external CLI, or persist artifact
-//! metadata.  Generated local adapters still pass through wasm-bindgen's real
-//! ABI traits, descriptor functions, rustc/linking, and cli-support post-link
-//! pipeline.
+//! This crate deliberately owns only the small amount of information needed
+//! by wasm-bindgen.  UniFFI's metadata, type graph, capabilities, and target
+//! selection are lowered by the caller before this API is invoked.  Keeping
+//! that boundary local means this crate does not need to depend on a
+//! particular UniFFI revision or on a serialized interchange format.
+//!
+//! The [`WasmEnginePlan`] is an in-memory plan.  [`PostLinkPlan`] is the only
+//! post-link entry point: it keeps the cli-support `Bindgen` value private and
+//! returns an engine-owned output wrapper.  No external `wasm-bindgen`
+//! executable is inspected or invoked.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, ToTokens};
-use uniffi_js_abi::{AsyncKind, NamedTypeKind, OperationId, ScalarType, TypeSourceKey, ValueType};
-use uniffi_js_engine_schema::{BridgePlan, EngineKind};
 use wasm_bindgen_cli_support::{
-    Bindgen, BindingSurface, UniFfiBackendConfig, UniFfiBackendOperation,
+    Bindgen, BindingSurface, Output as CliOutput, UniFfiBackendConfig, UniFfiBackendOperation,
 };
 use wasm_bindgen_macro_support::{ExpansionBuilder, ExpansionContext};
 
@@ -32,7 +35,8 @@ impl RustPath {
         if segments.is_empty()
             || segments
                 .iter()
-                .any(|segment| !valid_rust_identifier(segment))
+                .enumerate()
+                .any(|(index, segment)| !valid_rust_path_segment(segment, index))
         {
             return Err(EngineError::InvalidRustPath(segments.join("::")));
         }
@@ -43,24 +47,117 @@ impl RustPath {
         let segments = self
             .0
             .iter()
-            .map(|segment| Ident::new(segment, Span::call_site()))
+            .enumerate()
+            .map(|(index, segment)| rust_path_ident(segment, index))
             .collect::<Vec<_>>();
         quote!(#(#segments)::* )
     }
 }
 
-fn valid_rust_identifier(value: &str) -> bool {
-    syn_identifier(value).is_some_and(|identifier| identifier.to_string() == value)
-}
-
-fn syn_identifier(value: &str) -> Option<Ident> {
-    if value.is_empty() {
-        return None;
+fn valid_rust_path_segment(value: &str, index: usize) -> bool {
+    // These path keywords are useful for generated adapters that live inside
+    // the same crate, but they are only valid as a path's first segment.
+    if matches!(value, "crate" | "self" | "super") {
+        return index == 0;
     }
-    std::panic::catch_unwind(|| Ident::new(value, Span::call_site())).ok()
+
+    if let Some(raw) = value.strip_prefix("r#") {
+        return valid_raw_identifier(raw);
+    }
+
+    valid_plain_identifier(value)
 }
 
-/// A carrier with a real wasm-bindgen ABI implementation.
+fn valid_plain_identifier(value: &str) -> bool {
+    if value.is_empty() || rust_keyword(value) {
+        return false;
+    }
+    std::panic::catch_unwind(|| Ident::new(value, Span::call_site()))
+        .map(|identifier| identifier.to_string() == value)
+        .unwrap_or(false)
+}
+
+fn valid_raw_identifier(value: &str) -> bool {
+    // Rust does not permit raw spellings of the path keywords below.  The
+    // remaining keywords (and ordinary names such as `Trait`) are valid raw
+    // identifiers and are emitted with `Ident::new_raw`.
+    if value.is_empty() || matches!(value, "crate" | "self" | "super" | "Self") {
+        return false;
+    }
+    std::panic::catch_unwind(|| Ident::new_raw(value, Span::call_site()))
+        .map(|identifier| identifier.to_string() == format!("r#{value}"))
+        .unwrap_or(false)
+}
+
+fn rust_path_ident(value: &str, index: usize) -> Ident {
+    if matches!(value, "crate" | "self" | "super") {
+        debug_assert_eq!(index, 0);
+        return Ident::new(value, Span::call_site());
+    }
+    if let Some(raw) = value.strip_prefix("r#") {
+        return Ident::new_raw(raw, Span::call_site());
+    }
+    Ident::new(value, Span::call_site())
+}
+
+fn rust_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "as" | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "async"
+            | "await"
+            | "dyn"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+            | "try"
+            | "union"
+    )
+}
+
+/// A local wasm carrier with a real wasm-bindgen ABI implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasmCarrier {
     Bool,
@@ -102,20 +199,31 @@ impl WasmCarrier {
     }
 }
 
-/// One already-lowered local adapter from the UniFFI Rust bridge plan.
+/// Whether a lowered wasm operation is synchronous or returns a future.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmAsyncKind {
+    Sync,
+    Async,
+}
+
+/// One already-lowered local adapter.
+///
+/// `operation_id` is intentionally a plain dense `u32`.  The UniFFI frontend
+/// assigns it before entering this crate; this crate validates density and
+/// uniqueness without knowing how that assignment was produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WasmOperationPlan {
-    pub operation_id: OperationId,
+    pub operation_id: u32,
     pub rust_call: RustPath,
     pub arguments: Vec<WasmCarrier>,
     pub return_carrier: Option<WasmCarrier>,
+    pub async_kind: WasmAsyncKind,
     pub fallible: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ValidatedOperation {
     plan: WasmOperationPlan,
-    async_kind: AsyncKind,
     raw_export_name: String,
 }
 
@@ -127,99 +235,40 @@ pub struct WasmEnginePlan {
 }
 
 impl WasmEnginePlan {
-    pub fn build(
-        bridge_plan: &BridgePlan,
-        operations: Vec<WasmOperationPlan>,
-    ) -> Result<Self, EngineError> {
-        Self::with_factory(bridge_plan, DEFAULT_BACKEND_FACTORY, operations)
+    pub fn build(operations: Vec<WasmOperationPlan>) -> Result<Self, EngineError> {
+        Self::with_factory(DEFAULT_BACKEND_FACTORY, operations)
     }
 
     pub fn with_factory(
-        bridge_plan: &BridgePlan,
         factory_export_name: impl Into<String>,
         operations: Vec<WasmOperationPlan>,
     ) -> Result<Self, EngineError> {
-        if !bridge_plan
-            .targets()
-            .iter()
-            .any(|target| target.engine == EngineKind::WasmBindgen)
-        {
-            return Err(EngineError::MissingWasmTarget);
-        }
-
+        let factory_export_name = factory_export_name.into();
         let mut supplied = BTreeMap::new();
         for operation in operations {
             let operation_id = operation.operation_id;
             if supplied.insert(operation_id, operation).is_some() {
-                return Err(EngineError::DuplicateOperation(operation_id.index()));
+                return Err(EngineError::DuplicateOperation(operation_id));
             }
         }
 
-        let named_types = bridge_plan
-            .types()
-            .iter()
-            .map(|ty| (ty.definition.source_key.clone(), &ty.definition.kind))
-            .collect::<BTreeMap<_, _>>();
-        let mut validated = Vec::with_capacity(bridge_plan.operations().len());
-        for bridge_operation in bridge_plan.operations() {
-            let operation_id = bridge_operation.operation.id;
-            let plan = supplied
-                .remove(&operation_id)
-                .ok_or(EngineError::MissingOperation(operation_id.index()))?;
-            let signature = &bridge_operation.operation.definition.signature;
-            if plan.arguments.len() != signature.arguments.len() {
-                return Err(EngineError::ArgumentCount {
-                    operation_id: operation_id.index(),
-                    expected: signature.arguments.len(),
-                    actual: plan.arguments.len(),
+        let mut validated = Vec::with_capacity(supplied.len());
+        for (expected, (operation_id, plan)) in supplied.into_iter().enumerate() {
+            let expected = u32::try_from(expected).map_err(|_| EngineError::TooManyOperations)?;
+            if operation_id != expected {
+                return Err(EngineError::NonDenseOperation {
+                    expected,
+                    found: operation_id,
                 });
             }
-            for (index, (carrier, argument)) in
-                plan.arguments.iter().zip(&signature.arguments).enumerate()
-            {
-                validate_carrier(*carrier, &argument.ty, &named_types).map_err(|reason| {
-                    EngineError::CarrierMismatch {
-                        operation_id: operation_id.index(),
-                        position: format!("argument[{index}]"),
-                        reason,
-                    }
-                })?;
-            }
-            match (&plan.return_carrier, &signature.return_type) {
-                (None, None) => {}
-                (Some(carrier), Some(value)) => {
-                    validate_carrier(*carrier, value, &named_types).map_err(|reason| {
-                        EngineError::CarrierMismatch {
-                            operation_id: operation_id.index(),
-                            position: "return".to_owned(),
-                            reason,
-                        }
-                    })?;
-                }
-                _ => {
-                    return Err(EngineError::CarrierMismatch {
-                        operation_id: operation_id.index(),
-                        position: "return".to_owned(),
-                        reason: "return carrier presence differs from BridgePlan".to_owned(),
-                    });
-                }
-            }
-            if plan.fallible != signature.throws.is_some() {
-                return Err(EngineError::FallibilityMismatch(operation_id.index()));
-            }
             validated.push(ValidatedOperation {
+                raw_export_name: format!("__uniffi_operation_{operation_id}"),
                 plan,
-                async_kind: signature.async_kind,
-                raw_export_name: format!("__uniffi_operation_{}", operation_id.index()),
             });
         }
-        if let Some(extra) = supplied.keys().next() {
-            return Err(EngineError::UnknownOperation(extra.index()));
-        }
 
-        // Reuse cli-support's identifier/dense-table validation rather than
-        // maintaining a second export-policy implementation here.
-        let factory_export_name = factory_export_name.into();
+        // Reuse cli-support's identifier/dense-table validation for the one
+        // backend factory, without exposing its config or Bindgen type.
         backend_config(&factory_export_name, &validated)?;
         Ok(Self {
             factory_export_name,
@@ -227,12 +276,23 @@ impl WasmEnginePlan {
         })
     }
 
-    pub fn configure_bindgen(&self, bindgen: &mut Bindgen) -> Result<(), EngineError> {
-        let config = backend_config(&self.factory_export_name, &self.operations)?;
-        bindgen
-            .typescript(false)
-            .binding_surface(BindingSurface::UniFfiBackend(config));
-        Ok(())
+    /// Prepare an in-process post-link operation for a Wasm file.
+    ///
+    /// The returned plan owns all cli-support configuration.  Callers do not
+    /// need, and cannot access, `wasm_bindgen_cli_support::Bindgen`.
+    pub fn post_link<P: AsRef<Path>>(
+        &self,
+        wasm_path: P,
+        module_name: impl Into<String>,
+        target: PostLinkTarget,
+    ) -> PostLinkPlan {
+        PostLinkPlan {
+            wasm_path: wasm_path.as_ref().to_owned(),
+            module_name: module_name.into(),
+            target,
+            backend: backend_config(&self.factory_export_name, &self.operations)
+                .expect("validated engine plan has a valid backend surface"),
+        }
     }
 
     pub fn expand(&self, context: ExpansionContext) -> Result<Vec<ExpandedOperation>, EngineError> {
@@ -256,7 +316,7 @@ fn backend_config(
         .iter()
         .map(|operation| {
             UniFfiBackendOperation::new(
-                operation.plan.operation_id.index(),
+                operation.plan.operation_id,
                 operation.raw_export_name.clone(),
             )
         })
@@ -266,61 +326,94 @@ fn backend_config(
         .map_err(|error| EngineError::Surface(error.to_string()))
 }
 
-fn validate_carrier(
-    carrier: WasmCarrier,
-    value: &ValueType,
-    named_types: &BTreeMap<TypeSourceKey, &NamedTypeKind>,
-) -> Result<(), String> {
-    if carrier == WasmCarrier::JsValue {
-        return Ok(());
-    }
-    let expected = match value {
-        ValueType::Scalar(scalar) => match scalar {
-            ScalarType::Bool => WasmCarrier::Bool,
-            ScalarType::I8 => WasmCarrier::I8,
-            ScalarType::U8 => WasmCarrier::U8,
-            ScalarType::I16 => WasmCarrier::I16,
-            ScalarType::U16 => WasmCarrier::U16,
-            ScalarType::I32 => WasmCarrier::I32,
-            ScalarType::U32 => WasmCarrier::U32,
-            ScalarType::I64 => WasmCarrier::I64,
-            ScalarType::U64 => WasmCarrier::U64,
-            ScalarType::F32 => WasmCarrier::F32,
-            ScalarType::F64 => WasmCarrier::F64,
-            ScalarType::String => WasmCarrier::String,
-            ScalarType::Bytes => WasmCarrier::Bytes,
-        },
-        ValueType::Named(key) if matches!(named_types.get(key), Some(NamedTypeKind::Object)) => {
-            WasmCarrier::OpaqueHandle
-        }
-        ValueType::InputStream(_) | ValueType::OutputStream(_) => WasmCarrier::OpaqueHandle,
-        _ => {
-            return Err(
-                "structured/optional collection values must use a real JsValue carrier".to_owned(),
-            );
-        }
-    };
-    if carrier == expected {
-        Ok(())
-    } else {
-        Err(format!("expected {expected:?}, found {carrier:?}"))
+/// Loader mode used by [`PostLinkPlan`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostLinkTarget {
+    Web,
+    Bundler,
+    Node,
+}
+
+/// A configured in-process wasm-bindgen post-link operation.
+#[derive(Clone, Debug)]
+pub struct PostLinkPlan {
+    wasm_path: PathBuf,
+    module_name: String,
+    target: PostLinkTarget,
+    backend: UniFfiBackendConfig,
+}
+
+impl PostLinkPlan {
+    /// Run wasm-bindgen in process and return an engine-owned output.
+    pub fn run(&self) -> Result<PostLinkOutput, EngineError> {
+        let mut bindgen = Bindgen::new();
+        bindgen
+            .input_path(&self.wasm_path)
+            .out_name(&self.module_name)
+            .typescript(false)
+            .binding_surface(BindingSurface::UniFfiBackend(self.backend.clone()));
+        match self.target {
+            PostLinkTarget::Web => bindgen
+                .web(true)
+                .map_err(|error| EngineError::PostLink(error.to_string()))?,
+            PostLinkTarget::Bundler => bindgen
+                .bundler(true)
+                .map_err(|error| EngineError::PostLink(error.to_string()))?,
+            PostLinkTarget::Node => bindgen
+                .nodejs(true)
+                .map_err(|error| EngineError::PostLink(error.to_string()))?,
+        };
+        bindgen
+            .generate_output()
+            .map(|output| PostLinkOutput { output })
+            .map_err(|error| EngineError::PostLink(error.to_string()))
     }
 }
 
-/// Tokens emitted by macro-support for one operation.  These tokens include
-/// the real raw shim, custom-section bytes, and `WasmDescribe` descriptor.
-#[derive(Clone, Debug)]
-pub struct ExpandedOperation {
-    pub operation_id: OperationId,
-    pub raw_export_name: String,
-    pub tokens: TokenStream,
+/// Engine-owned result of [`PostLinkPlan::run`].
+///
+/// The wrapper intentionally exposes strings, bytes, and a small emit helper
+/// instead of leaking cli-support's `Output`/`Bindgen` types across the engine
+/// boundary.
+pub struct PostLinkOutput {
+    output: CliOutput,
+}
+
+impl PostLinkOutput {
+    pub fn js(&self) -> &str {
+        self.output.js()
+    }
+
+    pub fn typescript(&self) -> Option<&str> {
+        self.output.ts()
+    }
+
+    pub fn wasm_bytes(&mut self) -> Vec<u8> {
+        self.output.wasm_mut().emit_wasm()
+    }
+
+    pub fn wasm_export_names(&self) -> Vec<String> {
+        self.output
+            .wasm()
+            .exports
+            .iter()
+            .map(|export| export.name.clone())
+            .collect()
+    }
+
+    /// Emit the complete loader package to `out_dir`.
+    pub fn emit(mut self, out_dir: impl AsRef<Path>) -> Result<(), EngineError> {
+        self.output
+            .emit(out_dir)
+            .map_err(|error| EngineError::PostLink(error.to_string()))
+    }
 }
 
 fn expand_operation(
     builder: &ExpansionBuilder,
     operation: &ValidatedOperation,
 ) -> Result<ExpandedOperation, EngineError> {
-    let operation_id = operation.plan.operation_id.index();
+    let operation_id = operation.plan.operation_id;
     let rust_name = Ident::new(
         &format!("__uniffi_wasm_operation_{operation_id}"),
         Span::call_site(),
@@ -350,8 +443,8 @@ fn expand_operation(
     } else {
         return_type
     };
-    let await_call = (operation.async_kind == AsyncKind::Async).then(|| quote!(.await));
-    let async_token = (operation.async_kind == AsyncKind::Async).then(|| quote!(async));
+    let await_call = (operation.plan.async_kind == WasmAsyncKind::Async).then(|| quote!(.await));
+    let async_token = (operation.plan.async_kind == WasmAsyncKind::Async).then(|| quote!(async));
     let input = quote! {
         pub #async_token fn #rust_name(#(#argument_declarations),*) -> #return_type {
             #call(#(#argument_names),*)#await_call
@@ -365,70 +458,47 @@ fn expand_operation(
         .expand(attr, input)
         .map_err(|diagnostic| EngineError::Expansion(diagnostic.into_token_stream().to_string()))?;
     Ok(ExpandedOperation {
-        operation_id: operation.plan.operation_id,
+        operation_id,
         raw_export_name: operation.raw_export_name.clone(),
         tokens,
     })
 }
 
+/// Tokens emitted by macro-support for one operation.  These tokens include
+/// the real raw shim, custom-section bytes, and `WasmDescribe` descriptor.
+#[derive(Clone, Debug)]
+pub struct ExpandedOperation {
+    pub operation_id: u32,
+    pub raw_export_name: String,
+    pub tokens: TokenStream,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum EngineError {
-    MissingWasmTarget,
     InvalidRustPath(String),
     DuplicateOperation(u32),
-    MissingOperation(u32),
-    UnknownOperation(u32),
-    ArgumentCount {
-        operation_id: u32,
-        expected: usize,
-        actual: usize,
-    },
-    CarrierMismatch {
-        operation_id: u32,
-        position: String,
-        reason: String,
-    },
-    FallibilityMismatch(u32),
+    NonDenseOperation { expected: u32, found: u32 },
+    TooManyOperations,
     Surface(String),
     Expansion(String),
+    PostLink(String),
 }
 
 impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingWasmTarget => {
-                formatter.write_str("BridgePlan does not target wasm-bindgen")
-            }
             Self::InvalidRustPath(path) => {
                 write!(formatter, "invalid structured Rust path `{path}`")
             }
             Self::DuplicateOperation(id) => write!(formatter, "duplicate wasm operation {id}"),
-            Self::MissingOperation(id) => write!(formatter, "missing wasm operation {id}"),
-            Self::UnknownOperation(id) => write!(formatter, "unknown wasm operation {id}"),
-            Self::ArgumentCount {
-                operation_id,
-                expected,
-                actual,
-            } => write!(
+            Self::NonDenseOperation { expected, found } => write!(
                 formatter,
-                "operation {operation_id} expects {expected} carriers, found {actual}"
+                "wasm operation IDs must be dense: expected {expected}, found {found}"
             ),
-            Self::CarrierMismatch {
-                operation_id,
-                position,
-                reason,
-            } => write!(
-                formatter,
-                "operation {operation_id} {position} carrier mismatch: {reason}"
-            ),
-            Self::FallibilityMismatch(id) => {
-                write!(
-                    formatter,
-                    "operation {id} fallibility differs from BridgePlan"
-                )
-            }
+            Self::TooManyOperations => formatter.write_str("too many wasm operations"),
             Self::Surface(message) => write!(formatter, "invalid backend surface: {message}"),
             Self::Expansion(message) => write!(formatter, "macro expansion failed: {message}"),
+            Self::PostLink(message) => write!(formatter, "wasm post-link failed: {message}"),
         }
     }
 }
@@ -438,73 +508,36 @@ impl Error for EngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniffi_js_abi::{
-        assign_component_ids, assign_operation_ids, ArgumentDefinition, ComponentDefinition,
-        ComponentKey, OperationDefinition, OperationKind, OperationOwner, OperationSignature,
-        OperationSourceKey, Ownership,
-    };
-    use uniffi_js_engine_schema::{
-        BridgePlanInput, Capability, EngineCapabilities, PlannedOperation,
-    };
 
-    fn bridge_plan() -> BridgePlan {
-        let component = ComponentKey::new("fixture").unwrap();
-        let components =
-            assign_component_ids([ComponentDefinition::new(component.clone(), "fixture").unwrap()])
-                .unwrap();
-        let operations = assign_operation_ids([OperationDefinition::new(
-            OperationSourceKey::new(
-                component,
-                OperationOwner::Namespace,
-                OperationKind::Function,
-                "increment",
-            )
-            .unwrap(),
-            "increment",
-            "fixture.increment",
-            "uniffi_fixture_increment",
-            OperationSignature {
-                arguments: vec![ArgumentDefinition::new(
-                    "value",
-                    ValueType::Scalar(ScalarType::I32),
-                    Ownership::Owned,
-                )
-                .unwrap()],
-                return_type: Some(ValueType::Scalar(ScalarType::I32)),
-                async_kind: AsyncKind::Sync,
-                throws: None,
-            },
-        )
-        .unwrap()])
-        .unwrap();
-        BridgePlan::build(BridgePlanInput {
-            components,
-            types: vec![],
-            operations: operations.into_iter().map(PlannedOperation::new).collect(),
-            callbacks: vec![],
-            streams: vec![],
-            targets: vec![EngineCapabilities::new(
-                EngineKind::WasmBindgen,
-                [Capability::Primitive, Capability::SyncCall],
-            )],
-        })
-        .unwrap()
-    }
-
-    fn operation(carrier: WasmCarrier) -> WasmOperationPlan {
+    fn operation(id: u32) -> WasmOperationPlan {
         WasmOperationPlan {
-            operation_id: OperationId::new(0),
+            operation_id: id,
             rust_call: RustPath::new(["fixture".to_owned(), "increment".to_owned()]).unwrap(),
-            arguments: vec![carrier],
+            arguments: vec![WasmCarrier::I32],
             return_carrier: Some(WasmCarrier::I32),
+            async_kind: WasmAsyncKind::Sync,
             fallible: false,
         }
     }
 
     #[test]
-    fn structured_plan_expands_real_wasm_descriptors_and_configures_factory() {
-        let plan =
-            WasmEnginePlan::build(&bridge_plan(), vec![operation(WasmCarrier::I32)]).unwrap();
+    fn engine_plan_owns_dense_operation_validation() {
+        let plan = WasmEnginePlan::build(vec![operation(1)]).unwrap_err();
+        assert_eq!(
+            plan,
+            EngineError::NonDenseOperation {
+                expected: 0,
+                found: 1
+            }
+        );
+
+        let duplicate = WasmEnginePlan::build(vec![operation(0), operation(0)]).unwrap_err();
+        assert_eq!(duplicate, EngineError::DuplicateOperation(0));
+    }
+
+    #[test]
+    fn structured_plan_expands_real_wasm_descriptors() {
+        let plan = WasmEnginePlan::build(vec![operation(0)]).unwrap();
         let context = ExpansionContext::new(
             std::env::current_dir().unwrap(),
             "fixture",
@@ -521,20 +554,19 @@ mod tests {
         assert!(tokens.contains("WasmDescribe"));
         assert!(tokens.contains("__wbindgen_describe"));
         assert!(!tokens.contains("compile_error"));
-
-        let mut bindgen = Bindgen::new();
-        bindgen.web(true).unwrap();
-        plan.configure_bindgen(&mut bindgen).unwrap();
-        assert!(matches!(
-            bindgen.selected_binding_surface(),
-            BindingSurface::UniFfiBackend(_)
-        ));
     }
 
     #[test]
-    fn carrier_plan_cannot_bypass_wasm_abi_shape() {
-        let error = WasmEnginePlan::build(&bridge_plan(), vec![operation(WasmCarrier::String)])
-            .unwrap_err();
-        assert!(matches!(error, EngineError::CarrierMismatch { .. }));
+    fn paths_reject_keywords_and_non_identifiers() {
+        assert!(RustPath::new(["fn".to_owned()]).is_err());
+        assert!(RustPath::new(["crate".to_owned(), "fixture".to_owned()]).is_ok());
+        assert!(RustPath::new(["fixture".to_owned(), "self".to_owned()]).is_err());
+        assert!(RustPath::new(["r#type".to_owned(), "r#Trait".to_owned()]).is_ok());
+        assert!(RustPath::new(["r#".to_owned()]).is_err());
+        assert!(RustPath::new(["r#self".to_owned()]).is_err());
+        let raw = RustPath::new(["r#type".to_owned(), "r#Trait".to_owned()]).unwrap();
+        assert_eq!(raw.tokens().to_string(), "r#type :: r#Trait");
+        assert!(RustPath::new(["1not_ident".to_owned()]).is_err());
+        assert!(RustPath::new(["fixture".to_owned(), "increment".to_owned()]).is_ok());
     }
 }

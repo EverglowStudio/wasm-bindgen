@@ -1,24 +1,12 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
-use uniffi_js_abi::{
-    assign_component_ids, assign_operation_ids, assign_type_ids, ArgumentDefinition, AsyncKind,
-    ComponentDefinition, ComponentKey, EnumVariant, NamedTypeKind, OperationDefinition,
-    OperationId, OperationKind, OperationOwner, OperationSignature, OperationSourceKey, Ownership,
-    ScalarType, TypeDefinition, TypeSourceKey, ValueType,
-};
-use uniffi_js_engine_schema::{
-    BridgePlan, BridgePlanInput, CallbackContract, CallbackReentrancy, CallbackRetention,
-    CallbackThreading, CallbackUseSite, Capability, EngineCapabilities, EngineKind,
-    PlannedOperation, ValuePath,
-};
-use wasm_bindgen_cli_support::Bindgen;
 use wasm_bindgen_macro_support::ExpansionContext;
 use wasm_bindgen_uniffi_engine::{
-    RustPath, WasmCarrier, WasmEnginePlan, WasmOperationPlan, DEFAULT_BACKEND_FACTORY,
+    PostLinkTarget, RustPath, WasmAsyncKind, WasmCarrier, WasmEnginePlan, WasmOperationPlan,
+    DEFAULT_BACKEND_FACTORY,
 };
 
 const FIXTURE_NAME: &str = "uniffi_wasm_engine_fixture";
@@ -31,279 +19,79 @@ fn repo_root() -> PathBuf {
         .to_owned()
 }
 
-fn operation(
-    component: &ComponentKey,
-    name: &str,
-    arguments: Vec<ArgumentDefinition>,
-    return_type: ValueType,
-    async_kind: AsyncKind,
-) -> OperationDefinition {
-    OperationDefinition::new(
-        OperationSourceKey::new(
-            component.clone(),
-            OperationOwner::Namespace,
-            OperationKind::Function,
-            name,
-        )
-        .unwrap(),
-        name,
-        format!("fixture.{name}"),
-        format!("uniffi_fixture_{name}"),
-        OperationSignature {
-            arguments,
-            return_type: Some(return_type),
-            async_kind,
-            throws: None,
-        },
-    )
-    .unwrap()
-}
-
-fn argument(name: &str, ty: ValueType) -> ArgumentDefinition {
-    ArgumentDefinition::new(name, ty, Ownership::Owned).unwrap()
-}
-
-fn callback_method(
-    component: &ComponentKey,
-    callback_key: &TypeSourceKey,
-    name: &str,
-    async_kind: AsyncKind,
-    throws: Option<TypeSourceKey>,
-) -> OperationDefinition {
-    OperationDefinition::new(
-        OperationSourceKey::new(
-            component.clone(),
-            OperationOwner::Callback(callback_key.clone()),
-            OperationKind::CallbackMethod,
-            name,
-        )
-        .unwrap(),
-        name,
-        format!("fixture.TextCallback.{name}"),
-        format!("uniffi_fixture_text_callback_{name}"),
-        OperationSignature {
-            arguments: vec![argument("text", ValueType::Scalar(ScalarType::String))],
-            return_type: Some(ValueType::Scalar(ScalarType::String)),
-            async_kind,
-            throws,
-        },
-    )
-    .unwrap()
-}
-
 fn engine_plan() -> WasmEnginePlan {
-    let component = ComponentKey::new("fixture").unwrap();
-    let callback_key = TypeSourceKey::new(component.clone(), "TextCallback").unwrap();
-    let error_key = TypeSourceKey::new(component.clone(), "CallbackError").unwrap();
-    let components =
-        assign_component_ids([ComponentDefinition::new(component.clone(), "fixture").unwrap()])
-            .unwrap();
-    let types = assign_type_ids([
-        TypeDefinition::new(
-            callback_key.clone(),
-            "TextCallback",
-            NamedTypeKind::Callback,
-        )
-        .unwrap(),
-        TypeDefinition::new(
-            error_key.clone(),
-            "CallbackError",
-            NamedTypeKind::Error {
-                variants: vec![EnumVariant::new("Rejected", vec![]).unwrap()],
-            },
-        )
-        .unwrap(),
-    ])
-    .unwrap();
-    let operations = assign_operation_ids([
+    let operation = |operation_id: u32,
+                     name: &str,
+                     arguments: Vec<WasmCarrier>,
+                     return_carrier: Option<WasmCarrier>,
+                     async_kind: WasmAsyncKind,
+                     fallible: bool| WasmOperationPlan {
+        operation_id,
+        rust_call: RustPath::new(["fixture".to_owned(), name.to_owned()]).unwrap(),
+        arguments,
+        return_carrier,
+        async_kind,
+        fallible,
+    };
+
+    WasmEnginePlan::build(vec![
         operation(
-            &component,
+            0,
             "a_roundtrip",
-            vec![
-                argument("text", ValueType::Scalar(ScalarType::String)),
-                argument("bytes", ValueType::Scalar(ScalarType::Bytes)),
-            ],
-            ValueType::Scalar(ScalarType::String),
-            AsyncKind::Sync,
+            vec![WasmCarrier::String, WasmCarrier::Bytes],
+            Some(WasmCarrier::String),
+            WasmAsyncKind::Sync,
+            false,
         ),
         operation(
-            &component,
+            1,
             "b_async_bytes",
-            vec![argument("text", ValueType::Scalar(ScalarType::String))],
-            ValueType::Scalar(ScalarType::Bytes),
-            AsyncKind::Async,
+            vec![WasmCarrier::String],
+            Some(WasmCarrier::Bytes),
+            WasmAsyncKind::Async,
+            false,
         ),
         operation(
-            &component,
+            2,
             "c_make_callback",
-            vec![argument("prefix", ValueType::Scalar(ScalarType::String))],
-            ValueType::Named(callback_key.clone()),
-            AsyncKind::Sync,
+            vec![WasmCarrier::String],
+            Some(WasmCarrier::JsValue),
+            WasmAsyncKind::Sync,
+            false,
         ),
-        callback_method(
-            &component,
-            &callback_key,
+        operation(
+            3,
             "d_sync_infallible",
-            AsyncKind::Sync,
-            None,
+            vec![WasmCarrier::String],
+            Some(WasmCarrier::String),
+            WasmAsyncKind::Sync,
+            false,
         ),
-        callback_method(
-            &component,
-            &callback_key,
+        operation(
+            4,
             "e_sync_fallible",
-            AsyncKind::Sync,
-            Some(error_key.clone()),
+            vec![WasmCarrier::String],
+            Some(WasmCarrier::String),
+            WasmAsyncKind::Sync,
+            true,
         ),
-        callback_method(
-            &component,
-            &callback_key,
+        operation(
+            5,
             "f_async_infallible",
-            AsyncKind::Async,
-            None,
+            vec![WasmCarrier::String],
+            Some(WasmCarrier::String),
+            WasmAsyncKind::Async,
+            false,
         ),
-        callback_method(
-            &component,
-            &callback_key,
+        operation(
+            6,
             "g_async_fallible",
-            AsyncKind::Async,
-            Some(error_key),
+            vec![WasmCarrier::String],
+            Some(WasmCarrier::String),
+            WasmAsyncKind::Async,
+            true,
         ),
     ])
-    .unwrap();
-    let callback_operations = operations
-        .iter()
-        .filter(|operation| {
-            matches!(
-                operation.definition.source_key.owner(),
-                OperationOwner::Callback(_)
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(callback_operations.len(), 4);
-    assert_eq!(
-        callback_operations
-            .iter()
-            .map(|operation| {
-                (
-                    operation.definition.public_name.as_str(),
-                    operation.definition.signature.async_kind,
-                    operation.definition.signature.throws.is_some(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        [
-            ("d_sync_infallible", AsyncKind::Sync, false),
-            ("e_sync_fallible", AsyncKind::Sync, true),
-            ("f_async_infallible", AsyncKind::Async, false),
-            ("g_async_fallible", AsyncKind::Async, true),
-        ]
-    );
-
-    let callback_type = types
-        .iter()
-        .find(|ty| ty.definition.source_key == callback_key)
-        .unwrap()
-        .id;
-    let operation_ids = operations
-        .iter()
-        .map(|operation| (operation.definition.public_name.clone(), operation.id))
-        .collect::<BTreeMap<_, _>>();
-    let operation_id = |name: &str| *operation_ids.get(name).unwrap();
-
-    let bridge_plan = BridgePlan::build(BridgePlanInput {
-        components,
-        types,
-        operations: operations.into_iter().map(PlannedOperation::new).collect(),
-        callbacks: vec![CallbackUseSite {
-            operation_id: operation_id("c_make_callback"),
-            callback_type,
-            path: ValuePath::return_value(),
-            contract: CallbackContract {
-                retention: CallbackRetention::Retained,
-                threading: CallbackThreading::CallingThread,
-                reentrancy: CallbackReentrancy::Allowed,
-            },
-        }],
-        streams: vec![],
-        targets: vec![EngineCapabilities::new(
-            EngineKind::WasmBindgen,
-            [
-                Capability::Primitive,
-                Capability::String,
-                Capability::Bytes,
-                Capability::SyncCall,
-                Capability::AsyncCall,
-                Capability::Callback,
-                Capability::RetainedCallback,
-                Capability::CallbackReentrancy,
-                Capability::AsyncCallback,
-                Capability::FallibleCallback,
-                Capability::DeclaredError,
-            ],
-        )],
-    })
-    .unwrap();
-
-    WasmEnginePlan::build(
-        &bridge_plan,
-        vec![
-            WasmOperationPlan {
-                operation_id: OperationId::new(0),
-                rust_call: RustPath::new(["fixture".to_owned(), "a_roundtrip".to_owned()]).unwrap(),
-                arguments: vec![WasmCarrier::String, WasmCarrier::Bytes],
-                return_carrier: Some(WasmCarrier::String),
-                fallible: false,
-            },
-            WasmOperationPlan {
-                operation_id: OperationId::new(1),
-                rust_call: RustPath::new(["fixture".to_owned(), "b_async_bytes".to_owned()])
-                    .unwrap(),
-                arguments: vec![WasmCarrier::String],
-                return_carrier: Some(WasmCarrier::Bytes),
-                fallible: false,
-            },
-            WasmOperationPlan {
-                operation_id: operation_id("c_make_callback"),
-                rust_call: RustPath::new(["fixture".to_owned(), "c_make_callback".to_owned()])
-                    .unwrap(),
-                arguments: vec![WasmCarrier::String],
-                return_carrier: Some(WasmCarrier::JsValue),
-                fallible: false,
-            },
-            WasmOperationPlan {
-                operation_id: operation_id("d_sync_infallible"),
-                rust_call: RustPath::new(["fixture".to_owned(), "d_sync_infallible".to_owned()])
-                    .unwrap(),
-                arguments: vec![WasmCarrier::String],
-                return_carrier: Some(WasmCarrier::String),
-                fallible: false,
-            },
-            WasmOperationPlan {
-                operation_id: operation_id("e_sync_fallible"),
-                rust_call: RustPath::new(["fixture".to_owned(), "e_sync_fallible".to_owned()])
-                    .unwrap(),
-                arguments: vec![WasmCarrier::String],
-                return_carrier: Some(WasmCarrier::String),
-                fallible: true,
-            },
-            WasmOperationPlan {
-                operation_id: operation_id("f_async_infallible"),
-                rust_call: RustPath::new(["fixture".to_owned(), "f_async_infallible".to_owned()])
-                    .unwrap(),
-                arguments: vec![WasmCarrier::String],
-                return_carrier: Some(WasmCarrier::String),
-                fallible: false,
-            },
-            WasmOperationPlan {
-                operation_id: operation_id("g_async_fallible"),
-                rust_call: RustPath::new(["fixture".to_owned(), "g_async_fallible".to_owned()])
-                    .unwrap(),
-                arguments: vec![WasmCarrier::String],
-                return_carrier: Some(WasmCarrier::String),
-                fallible: true,
-            },
-        ],
-    )
     .unwrap()
 }
 
@@ -478,37 +266,30 @@ await assert.rejects(backend.call(6, 'reject'));
     )
 }
 
-fn generate_and_run_target(temp: &TempDir, plan: &WasmEnginePlan, wasm: &Path, target: &str) {
-    let module_name = format!("{FIXTURE_NAME}_{target}");
-    let output_dir = temp.path().join(target);
-    let mut bindgen = Bindgen::new();
-    bindgen.input_path(wasm).out_name(&module_name);
-    plan.configure_bindgen(&mut bindgen).unwrap();
-    match target {
-        "web" => {
-            bindgen.web(true).unwrap();
-        }
-        "bundler" => {
-            bindgen.bundler(true).unwrap();
-        }
-        "node" => {
-            bindgen.nodejs(true).unwrap();
-        }
-        _ => unreachable!(),
-    }
-
-    let mut output = bindgen.generate_output().unwrap();
-    assert!(output.ts().is_none());
+fn generate_and_run_target(
+    temp: &TempDir,
+    plan: &WasmEnginePlan,
+    wasm: &Path,
+    target: PostLinkTarget,
+) {
+    let target_name = match target {
+        PostLinkTarget::Web => "web",
+        PostLinkTarget::Bundler => "bundler",
+        PostLinkTarget::Node => "node",
+    };
+    let module_name = format!("{FIXTURE_NAME}_{target_name}");
+    let output_dir = temp.path().join(target_name);
+    let output = plan.post_link(wasm, &module_name, target).run().unwrap();
+    assert!(output.typescript().is_none());
     assert!(!output
-        .wasm()
-        .exports
+        .wasm_export_names()
         .iter()
-        .any(|export| export.name.starts_with("__wbindgen_describe")));
+        .any(|export| export.starts_with("__wbindgen_describe")));
     assert!(!output.js().contains("export function __uniffi_operation_"));
     assert!(!output.js().contains("exports.__uniffi_operation_"));
     output.emit(&output_dir).unwrap();
 
-    let module_type = if target == "node" {
+    let module_type = if target == PostLinkTarget::Node {
         r#"{"type":"commonjs"}"#
     } else {
         r#"{"type":"module"}"#
@@ -516,11 +297,11 @@ fn generate_and_run_target(temp: &TempDir, plan: &WasmEnginePlan, wasm: &Path, t
     fs::write(output_dir.join("package.json"), module_type).unwrap();
     fs::write(
         output_dir.join("run.mjs"),
-        runtime_script(&module_name, target == "web"),
+        runtime_script(&module_name, target == PostLinkTarget::Web),
     )
     .unwrap();
     let mut command = Command::new("node");
-    if target == "bundler" {
+    if target == PostLinkTarget::Bundler {
         command.arg("--experimental-wasm-modules");
     }
     let result = command
@@ -528,7 +309,7 @@ fn generate_and_run_target(temp: &TempDir, plan: &WasmEnginePlan, wasm: &Path, t
         .current_dir(&output_dir)
         .output()
         .unwrap();
-    assert_command_success(&format!("{target} factory runtime"), &result);
+    assert_command_success(&format!("{target_name} factory runtime"), &result);
 }
 
 #[test]
@@ -548,7 +329,7 @@ fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
     let tokens = |operation_id: u32| {
         expanded
             .iter()
-            .find(|operation| operation.operation_id == OperationId::new(operation_id))
+            .find(|operation| operation.operation_id == operation_id)
             .unwrap()
             .tokens
             .to_string()
@@ -571,7 +352,11 @@ fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
 
     let wasm = build_fixture(&temp, &plan);
 
-    for target in ["web", "bundler", "node"] {
+    for target in [
+        PostLinkTarget::Web,
+        PostLinkTarget::Bundler,
+        PostLinkTarget::Node,
+    ] {
         generate_and_run_target(&temp, &plan, &wasm, target);
     }
 }

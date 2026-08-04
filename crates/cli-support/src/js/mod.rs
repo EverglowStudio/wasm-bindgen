@@ -11,7 +11,7 @@ use crate::wit::{
 use crate::wit::{AdapterKind, Instruction, InstructionData};
 use crate::wit::{AuxEnum, AuxExport, AuxExportKind, AuxImport, AuxStruct};
 use crate::wit::{JsImport, JsImportName, NonstandardWitSection, WasmBindgenAux};
-use crate::{Bindgen, EncodeInto, OutputMode, PLACEHOLDER_MODULE};
+use crate::{Bindgen, BindingSurface, EncodeInto, OutputMode, PLACEHOLDER_MODULE};
 use anyhow::{anyhow, bail, Context as _, Error};
 use binding::TsReference;
 use std::borrow::Cow;
@@ -617,7 +617,7 @@ impl<'a> Context<'a> {
             parent_identifier: _,
         } = def;
         self.globals.push('\n');
-        if self.config.typescript && !ts_decl.is_empty() {
+        if self.config.typescript_enabled() && !ts_decl.is_empty() {
             self.typescript.push('\n');
         }
         // Unless it is `export ...declaration...` form (common case), write the declaration first
@@ -636,7 +636,7 @@ impl<'a> Context<'a> {
         } else if let Some(c) = comments {
             self.globals.push_str(c);
         }
-        if self.config.typescript && !ts_decl.is_empty() {
+        if self.config.typescript_enabled() && !ts_decl.is_empty() {
             if export_name.map(|name| name != id).unwrap_or(true) || *private {
                 if let Some(c) = ts_comments {
                     self.typescript.push_str(c);
@@ -692,7 +692,7 @@ impl<'a> Context<'a> {
                 }
             }
 
-            if self.config.typescript && !ts_decl.is_empty() {
+            if self.config.typescript_enabled() && !ts_decl.is_empty() {
                 if export_name == "default" {
                     self.typescript.push_str(&format!("export default {id};\n"));
                 } else if export_name == id {
@@ -750,7 +750,10 @@ impl<'a> Context<'a> {
         let body = std::mem::take(&mut self.globals);
         let body = body.trim();
 
-        if self.config.typescript && !self.config.mode.no_modules() && !self.config.mode.bundler() {
+        if self.config.typescript_enabled()
+            && !self.config.mode.no_modules()
+            && !self.config.mode.bundler()
+        {
             // jsr-self-types directive
             let directive = format!("/* @ts-self-types=\"./{module_name}.d.ts\" */\n");
             self.globals.push_str(&directive);
@@ -944,7 +947,7 @@ impl<'a> Context<'a> {
         }
 
         // Generate TypeScript definitions for init functions in web and no-modules modes
-        if self.config.typescript
+        if self.config.typescript_enabled()
             && matches!(
                 self.config.mode,
                 OutputMode::Web | OutputMode::NoModules { .. }
@@ -956,7 +959,7 @@ impl<'a> Context<'a> {
         }
 
         // Generate TypeScript definitions for Node.js with threads enabled
-        if self.config.typescript
+        if self.config.typescript_enabled()
             && matches!(self.config.mode, OutputMode::Node { .. })
             && self.threads_enabled
         {
@@ -1380,7 +1383,7 @@ export const __wbg_memory: WebAssembly.Memory;
     fn generate_bundler_start(&self, module_name: &str, needs_manual_start: bool) -> String {
         let mut start = String::new();
 
-        if self.config.typescript {
+        if self.config.typescript_enabled() {
             // jsr-self-types directive
             start.push_str(&format!(r#"/* @ts-self-types="./{module_name}.d.ts" */"#));
             start.push('\n');
@@ -2668,6 +2671,7 @@ if (require('worker_threads').isMainThread) {{
     }
 
     fn write_exports(&mut self) -> Result<(), Error> {
+        self.prepare_binding_surface()?;
         let exports = std::mem::take(&mut self.exports);
         // Reorder so a `class Child extends Parent { ... }` definition is
         // emitted after the `Parent` definition. BTreeMap iteration is by
@@ -2680,7 +2684,13 @@ if (require('worker_threads').isMainThread) {{
         for (ref export_name, export) in exports {
             match export {
                 ExportEntry::Definition(def) => {
-                    self.export_name_list.push(export_name.clone());
+                    if matches!(
+                        self.config.selected_binding_surface(),
+                        BindingSurface::Public
+                    ) || !def.private
+                    {
+                        self.export_name_list.push(export_name.clone());
+                    }
                     self.export_def(Some(export_name), &def);
                 }
                 ExportEntry::Namespace(ns) => {
@@ -2699,7 +2709,7 @@ if (require('worker_threads').isMainThread) {{
                     let mut leaf_ids = Vec::new();
                     let ns_dst =
                         self.write_namespace(&identifier, &ns.ns, emit_existing, &mut leaf_ids)?;
-                    let ts_dst = if self.config.typescript {
+                    let ts_dst = if self.config.typescript_enabled() {
                         Self::write_namespace_ts(&ns.ns, "")?
                     } else {
                         String::new()
@@ -2708,7 +2718,7 @@ if (require('worker_threads').isMainThread) {{
                         // The namespace root is a public `{}` symbol; its
                         // hoisted leaves are deps and `ns_dst` assembles the
                         // nested shape in the root's `__postset`.
-                        if self.config.typescript {
+                        if self.config.typescript_enabled() {
                             self.typescript
                                 .push_str(&format!("{identifier}: {ts_dst};\n"));
                         }
@@ -2744,6 +2754,95 @@ if (require('worker_threads').isMainThread) {{
                 }
             }
         }
+        Ok(())
+    }
+
+    fn prepare_binding_surface(&mut self) -> Result<(), Error> {
+        let BindingSurface::UniFfiBackend(config) = self.config.selected_binding_surface() else {
+            return Ok(());
+        };
+        let config = config.clone();
+
+        let mut operation_identifiers = Vec::with_capacity(config.operations().len());
+        for operation in config.operations() {
+            let entry = self
+                .exports
+                .get(operation.raw_export_name())
+                .with_context(|| {
+                    format!(
+                        "UniFFI operation {} references missing raw export `{}`",
+                        operation.operation_id(),
+                        operation.raw_export_name()
+                    )
+                })?;
+            let ExportEntry::Definition(definition) = entry else {
+                bail!(
+                    "UniFFI raw operation `{}` must be a flat function export",
+                    operation.raw_export_name()
+                );
+            };
+            operation_identifiers.push(definition.identifier.clone());
+        }
+
+        // The backend owns the complete generated surface.  Hide every raw
+        // wasm-bindgen API definition, including an accidentally unlisted one,
+        // and reject namespaces because they cannot be represented by the
+        // dense operation table without reintroducing a public API tree.
+        for (name, entry) in &mut self.exports {
+            match entry {
+                ExportEntry::Definition(definition) => definition.private = true,
+                ExportEntry::Namespace(_) => {
+                    bail!("UniFFI backend surface does not accept namespace export `{name}`")
+                }
+            }
+        }
+
+        if self.exports.contains_key(config.factory_export_name()) {
+            bail!(
+                "UniFFI backend factory `{}` collides with a generated export",
+                config.factory_export_name()
+            );
+        }
+
+        // Keep the local declaration distinct from the public export name so
+        // `export_def` emits one alias after the table/factory declarations;
+        // prefixing `export` to a multi-declaration block would accidentally
+        // expose the operation table as well.
+        let factory_identifier =
+            self.generate_identifier(&format!("{}_impl", config.factory_export_name()));
+        let table_identifier =
+            self.generate_identifier(&format!("{}_operations", config.factory_export_name()));
+        let operation_count = operation_identifiers.len();
+        let definition = format!(
+            "const {table_identifier} = Object.freeze([{operations}]);\n\
+             function {factory_identifier}() {{\n\
+                 if ({table_identifier}.length !== {operation_count} || {table_identifier}.some((operation) => typeof operation !== 'function')) {{\n\
+                     throw new Error('incomplete UniFFI wasm backend operation table');\n\
+                 }}\n\
+                 return Object.freeze({{\n\
+                     operationCount: {operation_count},\n\
+                     call(operationId, ...args) {{\n\
+                         if (!Number.isInteger(operationId) || operationId < 0 || operationId >= {table_identifier}.length) {{\n\
+                             throw new RangeError(`unknown UniFFI operation ${{operationId}}`);\n\
+                         }}\n\
+                         return {table_identifier}[operationId](...args);\n\
+                     }}\n\
+                 }});\n\
+             }}\n",
+            operations = operation_identifiers.join(", "),
+        );
+        self.exports.insert(
+            config.factory_export_name().to_owned(),
+            ExportEntry::Definition(ExportDefinition {
+                identifier: factory_identifier,
+                comments: None,
+                definition,
+                ts_comments: None,
+                ts_definition: String::new(),
+                private: false,
+                parent_identifier: None,
+            }),
+        );
         Ok(())
     }
 
@@ -7615,4 +7714,50 @@ fn write_es_import(dest: &mut String, module: &str, items: &[(String, Option<Str
     dest.push_str(" } from '");
     dest.push_str(module);
     dest.push_str("';\n");
+}
+
+#[cfg(test)]
+mod uniffi_surface_tests {
+    use super::*;
+    use crate::{BindingSurface, UniFfiBackendConfig, UniFfiBackendOperation};
+
+    #[test]
+    fn raw_operations_are_private_and_only_factory_is_exported() {
+        let mut config = Bindgen::new();
+        config
+            .typescript(true)
+            .binding_surface(BindingSurface::UniFfiBackend(
+                UniFfiBackendConfig::new(
+                    "__uniffi_backend_factory",
+                    vec![UniFfiBackendOperation::new(0, "__uniffi_op_0").unwrap()],
+                )
+                .unwrap(),
+            ));
+        let mut module = Module::default();
+        let wit = NonstandardWitSection::default();
+        let aux = WasmBindgenAux::default();
+        let mut cx = Context::new(&mut module, &config, &wit, &aux).unwrap();
+        cx.exports.insert(
+            "__uniffi_op_0".to_owned(),
+            ExportEntry::Definition(ExportDefinition {
+                identifier: "__uniffi_op_0".to_owned(),
+                comments: None,
+                definition: "function __uniffi_op_0(value) { return value; }\n".to_owned(),
+                ts_comments: None,
+                ts_definition: "function __uniffi_op_0(value: number): number;\n".to_owned(),
+                private: false,
+                parent_identifier: None,
+            }),
+        );
+
+        cx.write_exports().unwrap();
+        assert!(cx.globals.contains("function __uniffi_op_0"));
+        assert!(!cx.globals.contains("export function __uniffi_op_0"));
+        assert!(cx
+            .globals
+            .contains("export { __uniffi_backend_factory_impl as __uniffi_backend_factory }"));
+        assert!(cx.globals.contains("Object.freeze"));
+        assert_eq!(cx.export_name_list, ["__uniffi_backend_factory"]);
+        assert!(!cx.typescript.contains("__uniffi_op_0"));
+    }
 }

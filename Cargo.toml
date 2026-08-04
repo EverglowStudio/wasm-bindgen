@@ -103,6 +103,7 @@ members = [
   "crates/test",
   "crates/test/sample",
   "crates/typescript-tests",
+  "crates/uniffi-engine",
   "crates/web-sys",
   "crates/webidl",
   "crates/webidl-tests",

@@ -17,7 +17,7 @@ use wasm_bindgen_shared::identifier::{is_js_keyword, is_non_value_js_keyword, is
 use crate::ast::{self, ThreadLocal};
 use crate::hash::ShortHash;
 use crate::ClassMarker;
-use crate::Diagnostic;
+use crate::{Diagnostic, ExpansionContext};
 
 thread_local!(static ATTRS: AttributeParseState = Default::default());
 
@@ -1080,7 +1080,7 @@ impl<'a>
                     .chars()
                     .filter(|&c| c.is_ascii_alphanumeric() || c == '_')
                     .collect::<String>(),
-                ShortHash(data)
+                ShortHash((program.expansion_context().symbol_salt(), data))
             )
         };
         if let Some(span) = opts.r#final() {
@@ -1146,6 +1146,7 @@ impl<'a>
             wasm_bindgen: program.wasm_bindgen.clone(),
             wasm_bindgen_futures: program.wasm_bindgen_futures.clone(),
             js_sys: program.js_sys.clone(),
+            use_js_sys_futures: program.use_js_sys_futures(),
             generics: self.sig.generics,
         });
         opts.check_used();
@@ -1167,7 +1168,11 @@ impl ConvertToAst<(&ast::Program, BindgenAttrs)> for syn::ForeignItemType {
         let typescript_type = attrs.typescript_type().map(|s| s.0.to_string());
         let is_type_of = attrs.is_type_of().cloned();
         let unraw_ident = self.ident.unraw();
-        let hash = ShortHash((attrs.js_namespace().map(|(ns, _)| ns.0), &unraw_ident));
+        let hash = ShortHash((
+            program.expansion_context().symbol_salt(),
+            attrs.js_namespace().map(|(ns, _)| ns.0),
+            &unraw_ident,
+        ));
         let shim = format!("__wbg_instanceof_{unraw_ident}_{hash}");
         let mut extends = Vec::new();
         let mut vendor_prefixes = Vec::new();
@@ -1250,7 +1255,12 @@ impl<'a> ConvertToAst<(&ast::Program, BindgenAttrs, &'a Option<ast::ImportModule
             .unwrap_or(&default_name)
             .to_string();
         let unraw_ident = self.ident.unraw();
-        let hash = ShortHash((&js_name, module, &unraw_ident));
+        let hash = ShortHash((
+            program.expansion_context().symbol_salt(),
+            &js_name,
+            module,
+            &unraw_ident,
+        ));
         let shim = format!("__wbg_static_accessor_{unraw_ident}_{hash}");
         let thread_local = opts.get_thread_local()?;
 
@@ -1310,7 +1320,11 @@ impl<'a> ConvertToAst<(&ast::Program, BindgenAttrs, &'a Option<ast::ImportModule
         };
 
         let unraw_ident = self.ident.unraw();
-        let hash = ShortHash((&module, &unraw_ident));
+        let hash = ShortHash((
+            program.expansion_context().symbol_salt(),
+            &module,
+            &unraw_ident,
+        ));
         let shim = format!("__wbg_string_{unraw_ident}_{hash}");
         opts.check_used();
         Ok(ast::ImportKind::String(ast::ImportString {
@@ -1811,6 +1825,7 @@ impl<'a> MacroParse<(Option<BindgenAttrs>, &'a mut TokenStream)> for syn::Item {
                     wasm_bindgen: program.wasm_bindgen.clone(),
                     wasm_bindgen_futures: program.wasm_bindgen_futures.clone(),
                     js_sys: program.js_sys.clone(),
+                    use_js_sys_futures: program.use_js_sys_futures(),
                 });
             }
             syn::Item::Impl(mut i) => {
@@ -2089,6 +2104,7 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
             wasm_bindgen: program.wasm_bindgen.clone(),
             wasm_bindgen_futures: program.wasm_bindgen_futures.clone(),
             js_sys: program.js_sys.clone(),
+            use_js_sys_futures: program.use_js_sys_futures(),
         });
         opts.check_used();
         Ok(())
@@ -2979,8 +2995,11 @@ fn operation_kind(opts: &BindgenAttrs) -> ast::OperationKind {
     operation_kind
 }
 
-pub fn link_to(opts: BindgenAttrs) -> Result<ast::LinkToModule, Diagnostic> {
-    let mut program = ast::Program::default();
+pub fn link_to(
+    opts: BindgenAttrs,
+    context: ExpansionContext,
+) -> Result<ast::LinkToModule, Diagnostic> {
+    let mut program = ast::Program::new(context);
     let module = module_from_opts(&mut program, &opts)?.ok_or_else(|| {
         Diagnostic::span_error(Span::call_site(), "`link_to!` requires a module.")
     })?;
@@ -3018,7 +3037,7 @@ fn main(program: &ast::Program, mut f: ItemFn, tokens: &mut TokenStream) -> Resu
     let wasm_bindgen = &program.wasm_bindgen;
     let wasm_bindgen_futures = &program.wasm_bindgen_futures;
     let js_sys = &program.js_sys;
-    let futures = if ast::use_js_sys_futures() {
+    let futures = if program.use_js_sys_futures() {
         quote::quote! { #js_sys::futures }
     } else {
         quote::quote! { #wasm_bindgen_futures }

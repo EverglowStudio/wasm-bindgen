@@ -1,0 +1,23 @@
+[package]
+name = "wasm-bindgen-uniffi-engine"
+version = "0.2.126"
+authors = ["The wasm-bindgen Developers"]
+description = "Programmatic wasm-bindgen engine adapter for UniFFI bridge plans"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/EverglowStudio/wasm-bindgen"
+edition = "2021"
+rust-version = "1.86"
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+uniffi_js_abi = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+uniffi_js_engine_schema = { git = "https://github.com/EverglowStudio/uniffi-rs.git", rev = "c87db9d984da6c065490dda864bdd13c6ab59f0b", version = "=0.32.0" }
+wasm-bindgen-cli-support = { path = "../cli-support", version = "=0.2.126" }
+wasm-bindgen-macro-support = { path = "../macro-support", version = "=0.2.126" }
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[lints]
+workspace = true

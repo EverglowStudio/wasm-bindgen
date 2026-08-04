@@ -2,21 +2,11 @@
 //! with all the added metadata necessary to generate Wasm bindings
 //! for it.
 
-use crate::{hash::ShortHash, Diagnostic};
+use crate::{hash::ShortHash, Diagnostic, ExpansionContext};
 use proc_macro2::{Ident, Span};
 use std::hash::{Hash, Hasher};
 use syn::Path;
 use wasm_bindgen_shared as shared;
-
-pub fn use_js_sys_futures() -> bool {
-    // Honor either the build-time cfg or an expansion-time environment variable.
-    // The env-var form is necessary because `cfg!(...)` is resolved when this
-    // proc-macro crate is itself compiled (on the host), and Cargo does not pass
-    // `--cfg`/`RUSTFLAGS` to host proc-macros when `--target` is used. Reading
-    // an env var at expansion time provides a stable workflow that works
-    // regardless of how the consumer configures Cargo.
-    cfg!(wasm_bindgen_use_js_sys) || std::env::var_os("WASM_BINDGEN_USE_JS_SYS").is_some()
-}
 
 /// Whether a function is a start function, and if so, whether it
 /// should be exported to JS.
@@ -39,6 +29,8 @@ impl StartKind {
 #[cfg_attr(feature = "extra-traits", derive(Debug))]
 #[derive(Clone)]
 pub struct Program {
+    /// Explicit package/target context for this expansion.
+    pub(crate) expansion_context: ExpansionContext,
     /// rust -> js interfaces
     pub exports: Vec<Export>,
     /// js -> rust interfaces
@@ -61,9 +53,10 @@ pub struct Program {
     pub wasm_bindgen_futures: Path,
 }
 
-impl Default for Program {
-    fn default() -> Self {
+impl Program {
+    pub fn new(expansion_context: ExpansionContext) -> Self {
         Self {
+            expansion_context,
             exports: Default::default(),
             imports: Default::default(),
             linked_modules: Default::default(),
@@ -76,14 +69,21 @@ impl Default for Program {
             wasm_bindgen_futures: syn::parse_quote! { wasm_bindgen_futures },
         }
     }
-}
 
-impl Program {
+    pub fn expansion_context(&self) -> &ExpansionContext {
+        &self.expansion_context
+    }
+
+    pub fn use_js_sys_futures(&self) -> bool {
+        self.expansion_context.use_js_sys_futures()
+    }
+
     /// Name of the link function for a specific linked module
     pub fn link_function_name(&self, idx: usize) -> String {
+        let salt = self.expansion_context.symbol_salt();
         let hash = match &self.linked_modules[idx] {
-            ImportModule::Inline(idx) => ShortHash((1, &self.inline_js[*idx])).to_string(),
-            other => ShortHash((0, other)).to_string(),
+            ImportModule::Inline(idx) => ShortHash((salt, 1, &self.inline_js[*idx])).to_string(),
+            other => ShortHash((salt, 0, other)).to_string(),
         };
         format!("__wbindgen_link_{hash}")
     }
@@ -127,6 +127,8 @@ pub struct Export {
     pub wasm_bindgen_futures: Path,
     /// Path to js_sys
     pub js_sys: Path,
+    /// Whether async glue should use `js_sys::futures` for this expansion.
+    pub use_js_sys_futures: bool,
 }
 
 /// The 3 types variations of `self`.
@@ -228,6 +230,8 @@ pub struct ImportFunction {
     pub wasm_bindgen_futures: Path,
     /// Path to js_sys
     pub js_sys: Path,
+    /// Whether async glue should use `js_sys::futures` for this expansion.
+    pub use_js_sys_futures: bool,
     /// Generic parameters as validated simple type parameters for this function
     pub generics: syn::Generics,
 }

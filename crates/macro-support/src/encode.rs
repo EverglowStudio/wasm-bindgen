@@ -2,7 +2,6 @@ use crate::hash::ShortHash;
 use proc_macro2::{Ident, Span};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use syn::ext::IdentExt;
@@ -24,7 +23,7 @@ pub struct EncodeResult {
 
 pub fn encode(program: &ast::Program) -> Result<EncodeResult, Diagnostic> {
     let mut e = Encoder::new();
-    let i = Interner::new();
+    let i = Interner::new(program.expansion_context());
     shared_program(program, &i)?.encode(&mut e);
     let custom_section = e.finish();
     let included_files = i
@@ -45,6 +44,7 @@ struct Interner {
     files: RefCell<HashMap<String, LocalFile>>,
     root: PathBuf,
     crate_name: String,
+    symbol_salt: usize,
     has_package_json: Cell<bool>,
 }
 
@@ -56,16 +56,13 @@ struct LocalFile {
 }
 
 impl Interner {
-    fn new() -> Interner {
-        let root = env::var_os("CARGO_MANIFEST_DIR")
-            .expect("should have CARGO_MANIFEST_DIR env var")
-            .into();
-        let crate_name = env::var("CARGO_PKG_NAME").expect("should have CARGO_PKG_NAME env var");
+    fn new(context: &crate::ExpansionContext) -> Interner {
         Interner {
             bump: bumpalo::Bump::new(),
             files: RefCell::new(HashMap::new()),
-            root,
-            crate_name,
+            root: context.manifest_dir().to_owned(),
+            crate_name: context.crate_name().to_owned(),
+            symbol_salt: context.symbol_salt(),
             has_package_json: Cell::new(false),
         }
     }
@@ -121,7 +118,7 @@ impl Interner {
     }
 
     fn unique_crate_identifier(&self) -> String {
-        format!("{}-{}", self.crate_name, ShortHash(0))
+        format!("{}-{}", self.crate_name, ShortHash((self.symbol_salt, 0)))
     }
 
     fn check_for_package_json(&self) {

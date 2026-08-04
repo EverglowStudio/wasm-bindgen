@@ -15,6 +15,14 @@ use syn::spanned::Spanned;
 use syn::{Attribute, Meta, MetaList};
 use wasm_bindgen_shared as shared;
 
+thread_local! {
+    static DESCRIPTORS_EMITTED: RefCell<HashSet<String>> = RefCell::default();
+}
+
+pub(crate) fn reset_descriptors_emitted() {
+    DESCRIPTORS_EMITTED.with(|descriptors| descriptors.borrow_mut().clear());
+}
+
 /// A trait for converting AST structs into Tokens and adding them to a TokenStream,
 /// or providing a diagnostic if conversion fails.
 pub trait TryToTokens {
@@ -685,7 +693,7 @@ impl TryToTokens for ast::Export {
         };
         let wasm_bindgen_futures = &self.wasm_bindgen_futures;
         let js_sys = &self.js_sys;
-        let futures = if ast::use_js_sys_futures() {
+        let futures = if self.use_js_sys_futures {
             quote! { #js_sys::futures }
         } else {
             quote! { #wasm_bindgen_futures }
@@ -2088,12 +2096,12 @@ impl TryToTokens for ast::ImportFunction {
         let wasm_bindgen = &self.wasm_bindgen;
         let wasm_bindgen_futures = &self.wasm_bindgen_futures;
         let js_sys = &self.js_sys;
-        let futures = if ast::use_js_sys_futures() {
+        let futures = if self.use_js_sys_futures {
             quote! { #js_sys::futures }
         } else {
             quote! { #wasm_bindgen_futures }
         };
-        let promise = if ast::use_js_sys_futures() {
+        let promise = if self.use_js_sys_futures {
             quote! { #js_sys::Promise }
         } else {
             quote! { #wasm_bindgen_futures::js_sys::Promise }
@@ -3189,10 +3197,6 @@ impl<T: ToTokens> ToTokens for Descriptor<'_, T> {
         // It's up to the descriptors themselves to ensure they have unique
         // names for unique items imported, currently done via `ShortHash` and
         // hashing appropriate data into the symbol name.
-        thread_local! {
-            static DESCRIPTORS_EMITTED: RefCell<HashSet<String>> = RefCell::default();
-        }
-
         let ident = self.ident;
 
         if !DESCRIPTORS_EMITTED.with(|list| list.borrow_mut().insert(ident.to_string())) {

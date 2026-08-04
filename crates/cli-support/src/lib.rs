@@ -6,8 +6,100 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::str;
 use walrus::Module;
+use wasm_bindgen_shared::identifier::is_valid_ident;
 
 pub(crate) const PLACEHOLDER_MODULE: &str = "__wbindgen_placeholder__";
+
+/// One raw operation exposed only through the UniFFI backend table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UniFfiBackendOperation {
+    operation_id: u32,
+    raw_export_name: String,
+}
+
+impl UniFfiBackendOperation {
+    pub fn new(operation_id: u32, raw_export_name: impl Into<String>) -> Result<Self, Error> {
+        let raw_export_name = raw_export_name.into();
+        if !is_valid_ident(&raw_export_name) {
+            bail!("UniFFI raw export `{raw_export_name}` is not a JavaScript identifier");
+        }
+        Ok(Self {
+            operation_id,
+            raw_export_name,
+        })
+    }
+
+    pub fn operation_id(&self) -> u32 {
+        self.operation_id
+    }
+
+    pub fn raw_export_name(&self) -> &str {
+        &self.raw_export_name
+    }
+}
+
+/// In-memory configuration for the private UniFFI backend surface.
+///
+/// This is deliberately not serializable and does not contain an artifact
+/// identity, schema version, digest, or manifest field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UniFfiBackendConfig {
+    factory_export_name: String,
+    operations: Vec<UniFfiBackendOperation>,
+}
+
+impl UniFfiBackendConfig {
+    pub fn new(
+        factory_export_name: impl Into<String>,
+        mut operations: Vec<UniFfiBackendOperation>,
+    ) -> Result<Self, Error> {
+        let factory_export_name = factory_export_name.into();
+        if !is_valid_ident(&factory_export_name) {
+            bail!("UniFFI backend factory `{factory_export_name}` is not a JavaScript identifier");
+        }
+        operations.sort_by_key(UniFfiBackendOperation::operation_id);
+        let mut names = HashSet::new();
+        for (expected, operation) in operations.iter().enumerate() {
+            let expected = u32::try_from(expected).context("too many UniFFI backend operations")?;
+            if operation.operation_id != expected {
+                bail!(
+                    "UniFFI backend operation IDs must be dense: expected {expected}, found {}",
+                    operation.operation_id
+                );
+            }
+            if operation.raw_export_name == factory_export_name {
+                bail!("UniFFI backend factory name collides with a raw operation export");
+            }
+            if !names.insert(operation.raw_export_name.clone()) {
+                bail!(
+                    "duplicate UniFFI raw operation export `{}`",
+                    operation.raw_export_name
+                );
+            }
+        }
+        Ok(Self {
+            factory_export_name,
+            operations,
+        })
+    }
+
+    pub fn factory_export_name(&self) -> &str {
+        &self.factory_export_name
+    }
+
+    pub fn operations(&self) -> &[UniFfiBackendOperation] {
+        &self.operations
+    }
+}
+
+/// Public wasm-bindgen bindings or the private UniFFI operation-table surface.
+/// This axis is independent of [`OutputMode`], so the same backend can use the
+/// Web, bundler, Node, or no-modules loader policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BindingSurface {
+    Public,
+    UniFfiBackend(UniFfiBackendConfig),
+}
 
 mod decode;
 mod descriptor;
@@ -43,6 +135,7 @@ pub struct Bindgen {
     split_linked_modules: bool,
     generate_reset_state: bool,
     force_enable_abort_handler: bool,
+    binding_surface: BindingSurface,
 }
 
 pub struct Output {
@@ -118,6 +211,7 @@ impl Bindgen {
             split_linked_modules: false,
             generate_reset_state: false,
             force_enable_abort_handler: false,
+            binding_surface: BindingSurface::Public,
         }
     }
 
@@ -248,6 +342,21 @@ impl Bindgen {
     pub fn typescript(&mut self, typescript: bool) -> &mut Bindgen {
         self.typescript = typescript;
         self
+    }
+
+    /// Select the export surface independently from the target loader mode.
+    /// No CLI flag is provided; engine integrations use this library API.
+    pub fn binding_surface(&mut self, surface: BindingSurface) -> &mut Bindgen {
+        self.binding_surface = surface;
+        self
+    }
+
+    pub fn selected_binding_surface(&self) -> &BindingSurface {
+        &self.binding_surface
+    }
+
+    pub(crate) fn typescript_enabled(&self) -> bool {
+        self.typescript && matches!(self.binding_surface, BindingSurface::Public)
     }
 
     pub fn omit_imports(&mut self, omit_imports: bool) -> &mut Bindgen {
@@ -516,7 +625,7 @@ impl Bindgen {
             snippets: aux.snippets.clone(),
             local_modules: aux.local_modules.clone(),
             mode: self.mode.clone(),
-            typescript: self.typescript,
+            typescript: self.typescript_enabled(),
             npm_dependencies: cx.npm_dependencies.clone(),
             js,
             ts,
@@ -931,4 +1040,62 @@ where
     let mut pairs = map.iter().collect::<Vec<_>>();
     pairs.sort_by_key(|(k, _)| *k);
     pairs.into_iter()
+}
+
+#[cfg(test)]
+mod uniffi_surface_api_tests {
+    use super::*;
+
+    fn surface() -> BindingSurface {
+        BindingSurface::UniFfiBackend(
+            UniFfiBackendConfig::new(
+                "__uniffi_backend_factory",
+                vec![UniFfiBackendOperation::new(0, "__uniffi_op_0").unwrap()],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn backend_surface_is_orthogonal_to_loader_target() {
+        for target in ["bundler", "web", "node"] {
+            let mut bindgen = Bindgen::new();
+            match target {
+                "bundler" => {
+                    bindgen.bundler(true).unwrap();
+                }
+                "web" => {
+                    bindgen.web(true).unwrap();
+                }
+                "node" => {
+                    bindgen.nodejs(true).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            bindgen.binding_surface(surface()).typescript(true);
+            assert!(matches!(
+                bindgen.selected_binding_surface(),
+                BindingSurface::UniFfiBackend(_)
+            ));
+            assert!(!bindgen.typescript_enabled());
+        }
+    }
+
+    #[test]
+    fn backend_operation_ids_are_dense_and_names_are_unique() {
+        let sparse = UniFfiBackendConfig::new(
+            "__uniffi_backend_factory",
+            vec![UniFfiBackendOperation::new(1, "__uniffi_op_1").unwrap()],
+        );
+        assert!(sparse.is_err());
+
+        let duplicate = UniFfiBackendConfig::new(
+            "__uniffi_backend_factory",
+            vec![
+                UniFfiBackendOperation::new(0, "__uniffi_op").unwrap(),
+                UniFfiBackendOperation::new(1, "__uniffi_op").unwrap(),
+            ],
+        );
+        assert!(duplicate.is_err());
+    }
 }

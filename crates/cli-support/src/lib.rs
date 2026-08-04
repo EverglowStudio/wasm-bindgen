@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Error};
+use serde::Serialize;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -10,23 +11,286 @@ use wasm_bindgen_shared::identifier::is_valid_ident;
 
 pub(crate) const PLACEHOLDER_MODULE: &str = "__wbindgen_placeholder__";
 
+/// Whether an engine-private operation is synchronous or asynchronous.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendAsyncKind {
+    Sync,
+    Async,
+}
+
+/// Mechanical operation kind projected from the canonical UniFFI plan.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendOperationKind {
+    Function,
+    Constructor,
+    Method,
+    CallbackMethod,
+    OutputStreamStart,
+    OutputStreamNext,
+    OutputStreamCancel,
+    InputStreamPull,
+    InputStreamCancel,
+}
+
+/// Carrier categories needed by the generated session.  This is not a
+/// public JavaScript type graph; the UniFFI frontend has already selected the
+/// concrete wasm carrier before reaching cli-support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendCarrier {
+    Primitive,
+    BigInt,
+    Bytes,
+    Timestamp,
+    Duration,
+    LocalAdapter,
+    OpaqueHandle,
+    CallbackProxy,
+    InputStream,
+    OutputStream,
+    StreamStep,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendResourceHook {
+    None,
+    AcquireObject,
+    ReleaseObject,
+    StartInputStream,
+    PullInputStream,
+    CancelInputStream,
+    CloseInputStream,
+    StartOutputStream,
+    PullOutputStream,
+    CancelOutputStream,
+    CloseOutputStream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum UniFfiBackendValuePathSegment {
+    Argument(u32),
+    Return,
+    Field(String),
+    Variant(String),
+    Optional,
+    SequenceItem,
+    SetItem,
+    MapKey,
+    MapValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UniFfiBackendValuePath(Vec<UniFfiBackendValuePathSegment>);
+
+impl UniFfiBackendValuePath {
+    pub fn new(segments: impl Into<Vec<UniFfiBackendValuePathSegment>>) -> Self {
+        Self(segments.into())
+    }
+
+    pub fn argument(index: u32) -> Self {
+        Self::new(vec![UniFfiBackendValuePathSegment::Argument(index)])
+    }
+
+    pub fn return_value() -> Self {
+        Self::new(vec![UniFfiBackendValuePathSegment::Return])
+    }
+
+    pub fn segments(&self) -> &[UniFfiBackendValuePathSegment] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendCallbackRetention {
+    Scoped,
+    Retained,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendCallbackThreading {
+    CallingThread,
+    MayCrossThread,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendCallbackReentrancy {
+    Forbidden,
+    Allowed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniFfiBackendCallbackContract {
+    pub retention: UniFfiBackendCallbackRetention,
+    pub threading: UniFfiBackendCallbackThreading,
+    pub reentrancy: UniFfiBackendCallbackReentrancy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniFfiBackendCallbackUseSite {
+    pub operation_id: u32,
+    pub callback_type_id: u32,
+    pub path: UniFfiBackendValuePath,
+    pub contract: UniFfiBackendCallbackContract,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendStreamDirection {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniFfiBackendStreamSlot {
+    pub use_site_id: u32,
+    pub operation_id: u32,
+    pub kind: UniFfiBackendOperationKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniFfiBackendStreamGroup {
+    pub operation_id: u32,
+    pub use_site_id: u32,
+    pub path: UniFfiBackendValuePath,
+    pub direction: UniFfiBackendStreamDirection,
+    pub item_carrier: UniFfiBackendCarrier,
+    pub error_carrier: UniFfiBackendCarrier,
+    pub is_send: bool,
+    pub slots: Vec<UniFfiBackendStreamSlot>,
+    pub resource_hooks: Vec<UniFfiBackendResourceHook>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "id", rename_all = "camelCase")]
+pub enum UniFfiBackendResource {
+    Object(u32),
+    InputStream(u32),
+    OutputStream(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniFfiBackendCallbackDispatch {
+    pub callback_type_id: u32,
+    pub method_id: u32,
+}
+
 /// One raw operation exposed only through the UniFFI backend table.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UniFfiBackendOperation {
     operation_id: u32,
+    #[serde(skip)]
     raw_export_name: String,
+    async_kind: UniFfiBackendAsyncKind,
+    kind: UniFfiBackendOperationKind,
+    fallible: bool,
+    argument_count: usize,
+    argument_carriers: Vec<UniFfiBackendCarrier>,
+    return_carrier: Option<UniFfiBackendCarrier>,
+    host_argument: bool,
+    callback_dispatch: Option<UniFfiBackendCallbackDispatch>,
+    callback_use_sites: Vec<UniFfiBackendCallbackUseSite>,
+    stream_groups: Vec<UniFfiBackendStreamGroup>,
+    stream_slot: Option<UniFfiBackendStreamSlot>,
+    receiver_resource: Option<UniFfiBackendResource>,
+    return_resource: Option<UniFfiBackendResource>,
+    resource_hooks: Vec<UniFfiBackendResourceHook>,
 }
 
 impl UniFfiBackendOperation {
-    pub fn new(operation_id: u32, raw_export_name: impl Into<String>) -> Result<Self, Error> {
+    pub fn new(
+        operation_id: u32,
+        raw_export_name: impl Into<String>,
+        async_kind: UniFfiBackendAsyncKind,
+        kind: UniFfiBackendOperationKind,
+        fallible: bool,
+        argument_carriers: Vec<UniFfiBackendCarrier>,
+        return_carrier: Option<UniFfiBackendCarrier>,
+    ) -> Result<Self, Error> {
         let raw_export_name = raw_export_name.into();
         if !is_valid_ident(&raw_export_name) {
             bail!("UniFFI raw export `{raw_export_name}` is not a JavaScript identifier");
         }
+        let argument_count = argument_carriers.len();
         Ok(Self {
             operation_id,
             raw_export_name,
+            async_kind,
+            kind,
+            fallible,
+            argument_count,
+            argument_carriers,
+            return_carrier,
+            host_argument: false,
+            callback_dispatch: None,
+            callback_use_sites: Vec::new(),
+            stream_groups: Vec::new(),
+            stream_slot: None,
+            receiver_resource: None,
+            return_resource: None,
+            resource_hooks: Vec::new(),
         })
+    }
+
+    pub fn with_callback_dispatch(mut self, callback_type_id: u32, method_id: u32) -> Self {
+        self.callback_dispatch = Some(UniFfiBackendCallbackDispatch {
+            callback_type_id,
+            method_id,
+        });
+        self
+    }
+
+    pub fn with_host_argument(mut self, host_argument: bool) -> Self {
+        self.host_argument = host_argument;
+        self
+    }
+
+    pub fn with_callback_use_sites(
+        mut self,
+        callback_use_sites: Vec<UniFfiBackendCallbackUseSite>,
+    ) -> Self {
+        self.callback_use_sites = callback_use_sites;
+        self
+    }
+
+    pub fn with_stream_groups(mut self, stream_groups: Vec<UniFfiBackendStreamGroup>) -> Self {
+        self.stream_groups = stream_groups;
+        self
+    }
+
+    pub fn with_stream_slot(mut self, stream_slot: Option<UniFfiBackendStreamSlot>) -> Self {
+        self.stream_slot = stream_slot;
+        self
+    }
+
+    pub fn with_receiver_resource(
+        mut self,
+        receiver_resource: Option<UniFfiBackendResource>,
+    ) -> Self {
+        self.receiver_resource = receiver_resource;
+        self
+    }
+
+    pub fn with_return_resource(mut self, return_resource: Option<UniFfiBackendResource>) -> Self {
+        self.return_resource = return_resource;
+        self
+    }
+
+    pub fn with_resource_hooks(mut self, resource_hooks: Vec<UniFfiBackendResourceHook>) -> Self {
+        self.resource_hooks = resource_hooks;
+        self
     }
 
     pub fn operation_id(&self) -> u32 {
@@ -38,6 +302,53 @@ impl UniFfiBackendOperation {
     }
 }
 
+/// Engine-private resource hooks are separate from the canonical operation
+/// table.  A release/close hook must never be inferred from a business
+/// operation ID.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UniFfiBackendResourceExports {
+    release_object_export_name: Option<String>,
+    close_output_stream_export_name: Option<String>,
+}
+
+impl UniFfiBackendResourceExports {
+    pub fn new(
+        release_object_export_name: Option<String>,
+        close_output_stream_export_name: Option<String>,
+    ) -> Result<Self, Error> {
+        for (role, name) in [
+            ("object release", release_object_export_name.as_deref()),
+            (
+                "output stream close",
+                close_output_stream_export_name.as_deref(),
+            ),
+        ] {
+            if let Some(name) = name {
+                if !is_valid_ident(name) {
+                    bail!("UniFFI {role} export `{name}` is not a JavaScript identifier");
+                }
+            }
+        }
+        if release_object_export_name == close_output_stream_export_name
+            && release_object_export_name.is_some()
+        {
+            bail!("UniFFI resource hook export names must be unique");
+        }
+        Ok(Self {
+            release_object_export_name,
+            close_output_stream_export_name,
+        })
+    }
+
+    pub fn release_object_export_name(&self) -> Option<&str> {
+        self.release_object_export_name.as_deref()
+    }
+
+    pub fn close_output_stream_export_name(&self) -> Option<&str> {
+        self.close_output_stream_export_name.as_deref()
+    }
+}
+
 /// In-memory configuration for the private UniFFI backend surface.
 ///
 /// This is deliberately not serializable and does not contain an artifact
@@ -46,12 +357,14 @@ impl UniFfiBackendOperation {
 pub struct UniFfiBackendConfig {
     factory_export_name: String,
     operations: Vec<UniFfiBackendOperation>,
+    resource_exports: UniFfiBackendResourceExports,
 }
 
 impl UniFfiBackendConfig {
     pub fn new(
         factory_export_name: impl Into<String>,
         mut operations: Vec<UniFfiBackendOperation>,
+        resource_exports: UniFfiBackendResourceExports,
     ) -> Result<Self, Error> {
         let factory_export_name = factory_export_name.into();
         if !is_valid_ident(&factory_export_name) {
@@ -76,10 +389,41 @@ impl UniFfiBackendConfig {
                     operation.raw_export_name
                 );
             }
+            validate_uniffi_backend_operation(operation, &operations)?;
+        }
+        for name in [
+            resource_exports.release_object_export_name(),
+            resource_exports.close_output_stream_export_name(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if name == factory_export_name || names.contains(name) {
+                bail!("UniFFI resource hook export `{name}` collides with another backend export");
+            }
+        }
+        let needs_object_release = operations.iter().any(|operation| {
+            matches!(
+                operation.return_resource,
+                Some(UniFfiBackendResource::Object(_))
+            )
+        });
+        if needs_object_release && resource_exports.release_object_export_name().is_none() {
+            bail!("UniFFI object results require an explicit object release export");
+        }
+        let needs_output_close = operations.iter().any(|operation| {
+            operation
+                .stream_groups
+                .iter()
+                .any(|group| group.direction == UniFfiBackendStreamDirection::Output)
+        });
+        if needs_output_close && resource_exports.close_output_stream_export_name().is_none() {
+            bail!("UniFFI output streams require an explicit close export");
         }
         Ok(Self {
             factory_export_name,
             operations,
+            resource_exports,
         })
     }
 
@@ -90,6 +434,190 @@ impl UniFfiBackendConfig {
     pub fn operations(&self) -> &[UniFfiBackendOperation] {
         &self.operations
     }
+
+    pub fn resource_exports(&self) -> &UniFfiBackendResourceExports {
+        &self.resource_exports
+    }
+
+    pub(crate) fn operation_metadata_json(&self) -> Result<String, Error> {
+        serde_json::to_string(&self.operations).context("serialize UniFFI backend operation plan")
+    }
+}
+
+fn validate_uniffi_backend_operation(
+    operation: &UniFfiBackendOperation,
+    operations: &[UniFfiBackendOperation],
+) -> Result<(), Error> {
+    if operation.argument_count != operation.argument_carriers.len() {
+        bail!(
+            "UniFFI operation {} has an inconsistent argument carrier table",
+            operation.operation_id
+        );
+    }
+    let callback_target = operation.callback_dispatch.is_some();
+    if callback_target != (operation.kind == UniFfiBackendOperationKind::CallbackMethod) {
+        bail!(
+            "UniFFI operation {} has an invalid callback Host dispatch",
+            operation.operation_id
+        );
+    }
+    if callback_target && operation.host_argument {
+        bail!(
+            "UniFFI callback Host operation {} cannot also receive the engine Host argument",
+            operation.operation_id
+        );
+    }
+    if matches!(
+        operation.kind,
+        UniFfiBackendOperationKind::InputStreamPull
+            | UniFfiBackendOperationKind::InputStreamCancel
+            | UniFfiBackendOperationKind::OutputStreamNext
+            | UniFfiBackendOperationKind::OutputStreamCancel
+    ) && operation.async_kind != UniFfiBackendAsyncKind::Async
+    {
+        bail!(
+            "UniFFI stream operation {} must be asynchronous",
+            operation.operation_id
+        );
+    }
+    if let Some(slot) = &operation.stream_slot {
+        let start_alias = slot.kind == UniFfiBackendOperationKind::OutputStreamStart
+            && operation.stream_groups.iter().any(|group| {
+                group.direction == UniFfiBackendStreamDirection::Output
+                    && group.use_site_id == slot.use_site_id
+            });
+        if slot.operation_id != operation.operation_id
+            || (slot.kind != operation.kind && !start_alias)
+        {
+            bail!(
+                "UniFFI operation {} has a mismatched stream slot identity",
+                operation.operation_id
+            );
+        }
+    }
+    for callback in &operation.callback_use_sites {
+        if callback.operation_id != operation.operation_id {
+            bail!(
+                "UniFFI callback use-site references operation {}, expected {}",
+                callback.operation_id,
+                operation.operation_id
+            );
+        }
+        validate_uniffi_value_path(operation, &callback.path, "callback")?;
+    }
+    for stream in &operation.stream_groups {
+        if stream.operation_id != operation.operation_id {
+            bail!(
+                "UniFFI stream use-site references operation {}, expected {}",
+                stream.operation_id,
+                operation.operation_id
+            );
+        }
+        validate_uniffi_value_path(operation, &stream.path, "stream")?;
+        let expected = match stream.direction {
+            UniFfiBackendStreamDirection::Input => [
+                UniFfiBackendOperationKind::InputStreamPull,
+                UniFfiBackendOperationKind::InputStreamCancel,
+            ]
+            .as_slice(),
+            UniFfiBackendStreamDirection::Output => [
+                UniFfiBackendOperationKind::OutputStreamStart,
+                UniFfiBackendOperationKind::OutputStreamNext,
+                UniFfiBackendOperationKind::OutputStreamCancel,
+            ]
+            .as_slice(),
+        };
+        if stream.slots.len() != expected.len()
+            || stream
+                .slots
+                .iter()
+                .any(|slot| !expected.contains(&slot.kind))
+        {
+            bail!(
+                "UniFFI stream use-site {} has a non-canonical slot set",
+                stream.use_site_id
+            );
+        }
+        let mut slot_kinds = HashSet::new();
+        let mut slot_ids = HashSet::new();
+        for kind in expected {
+            if !stream.slots.iter().any(|slot| slot.kind == *kind) {
+                bail!(
+                    "UniFFI stream use-site {} is missing its {:?} slot",
+                    stream.use_site_id,
+                    kind
+                );
+            }
+        }
+        for slot in &stream.slots {
+            if !slot_kinds.insert(slot.kind) || !slot_ids.insert(slot.operation_id) {
+                bail!(
+                    "UniFFI stream use-site {} has duplicate slots",
+                    stream.use_site_id
+                );
+            }
+            if slot.use_site_id != stream.use_site_id {
+                bail!(
+                    "UniFFI stream slot {} has a mismatched use-site ID",
+                    slot.operation_id
+                );
+            }
+            let Some(slot_operation) = operations.get(slot.operation_id as usize) else {
+                bail!(
+                    "UniFFI stream use-site {} references unknown operation {}",
+                    stream.use_site_id,
+                    slot.operation_id
+                );
+            };
+            if slot_operation.stream_slot.as_ref() != Some(slot) {
+                bail!(
+                    "UniFFI stream use-site {} has a mismatched slot operation {}",
+                    stream.use_site_id,
+                    slot.operation_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_uniffi_value_path(
+    operation: &UniFfiBackendOperation,
+    path: &UniFfiBackendValuePath,
+    role: &str,
+) -> Result<(), Error> {
+    let Some(root) = path.segments().first() else {
+        bail!(
+            "UniFFI {role} use-site for operation {} has an empty value path",
+            operation.operation_id
+        );
+    };
+    match root {
+        UniFfiBackendValuePathSegment::Argument(index)
+            if (*index as usize) < operation.argument_count => {}
+        UniFfiBackendValuePathSegment::Return => {}
+        UniFfiBackendValuePathSegment::Argument(index) => bail!(
+            "UniFFI {role} use-site argument {} is out of range for operation {}",
+            index,
+            operation.operation_id
+        ),
+        _ => bail!(
+            "UniFFI {role} use-site for operation {} has a non-root first segment",
+            operation.operation_id
+        ),
+    }
+    if path.segments().iter().skip(1).any(|segment| {
+        matches!(
+            segment,
+            UniFfiBackendValuePathSegment::Argument(_) | UniFfiBackendValuePathSegment::Return
+        )
+    }) {
+        bail!(
+            "UniFFI {role} use-site for operation {} has a nested root segment",
+            operation.operation_id
+        );
+    }
+    Ok(())
 }
 
 /// Public wasm-bindgen bindings or the private UniFFI operation-table surface.
@@ -1046,11 +1574,25 @@ where
 mod uniffi_surface_api_tests {
     use super::*;
 
+    fn operation(id: u32, name: &str) -> UniFfiBackendOperation {
+        UniFfiBackendOperation::new(
+            id,
+            name,
+            UniFfiBackendAsyncKind::Sync,
+            UniFfiBackendOperationKind::Function,
+            false,
+            vec![UniFfiBackendCarrier::Primitive],
+            Some(UniFfiBackendCarrier::Primitive),
+        )
+        .unwrap()
+    }
+
     fn surface() -> BindingSurface {
         BindingSurface::UniFfiBackend(
             UniFfiBackendConfig::new(
                 "__uniffi_backend_factory",
-                vec![UniFfiBackendOperation::new(0, "__uniffi_op_0").unwrap()],
+                vec![operation(0, "__uniffi_op_0")],
+                UniFfiBackendResourceExports::default(),
             )
             .unwrap(),
         )
@@ -1085,16 +1627,15 @@ mod uniffi_surface_api_tests {
     fn backend_operation_ids_are_dense_and_names_are_unique() {
         let sparse = UniFfiBackendConfig::new(
             "__uniffi_backend_factory",
-            vec![UniFfiBackendOperation::new(1, "__uniffi_op_1").unwrap()],
+            vec![operation(1, "__uniffi_op_1")],
+            UniFfiBackendResourceExports::default(),
         );
         assert!(sparse.is_err());
 
         let duplicate = UniFfiBackendConfig::new(
             "__uniffi_backend_factory",
-            vec![
-                UniFfiBackendOperation::new(0, "__uniffi_op").unwrap(),
-                UniFfiBackendOperation::new(1, "__uniffi_op").unwrap(),
-            ],
+            vec![operation(0, "__uniffi_op"), operation(1, "__uniffi_op")],
+            UniFfiBackendResourceExports::default(),
         );
         assert!(duplicate.is_err());
     }

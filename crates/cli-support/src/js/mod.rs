@@ -71,6 +71,587 @@ impl ImportDefinition {
     }
 }
 
+/// Emit the one backend-session state machine used by every loader target.
+/// The plan is embedded directly into generated JavaScript; it is neither a
+/// persisted interchange schema nor a second source of UniFFI semantics.
+fn uniffi_backend_session_definition(
+    factory_identifier: &str,
+    table_identifier: &str,
+    operation_identifiers: &[String],
+    metadata: &str,
+    release_object_identifier: Option<&str>,
+    close_output_stream_identifier: Option<&str>,
+) -> String {
+    const TEMPLATE: &str = r#"
+const $TABLE$ = Object.freeze([$OPERATIONS$]);
+const $PLAN$ = Object.freeze($METADATA$);
+const $RESOURCE_HOOKS$ = Object.freeze({ releaseObject: $RELEASE_OBJECT$, closeOutputStream: $CLOSE_OUTPUT_STREAM$ });
+function $FACTORY$(host) {
+    if ($TABLE$.length !== $PLAN$.length || $TABLE$.some((operation) => typeof operation !== 'function')) {
+        throw new Error('incomplete UniFFI wasm backend operation table');
+    }
+    if (host === null || typeof host !== 'object') {
+        throw new TypeError('UniFFI wasm backend factory requires a Host object');
+    }
+    for (const method of ['invokeCallbackSync', 'invokeCallbackAsync', 'retainCallback', 'releaseCallback', 'pullInputStream', 'cancelInputStream', 'releaseInputStream']) {
+        if (typeof host[method] !== 'function') throw new TypeError(`UniFFI Host is missing ${method}()`);
+    }
+
+    let phase = 'open';
+    let generation = 1;
+    let nextLeaseId = 1;
+    let nextInvocationId = 1;
+    let closePromise = null;
+    const pending = new Set();
+    const cleanup = new Set();
+    const callbacks = new Map();
+    const retainedCallbacks = new Map();
+    const inputStreams = new Map();
+    const closedInputStreams = new Set();
+    const objectLeases = new Map();
+    const outputLeases = new Map();
+    const releasedLeases = new WeakSet();
+    const outputGroups = new Map();
+    const callbackOperations = new Map();
+
+    const callbackKey = (typeId, callbackId) => `${typeId}:${callbackId}`;
+    const closedError = () => new Error('UniFFI wasm backend session is closed');
+    const isThenable = (value) => value !== null && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function';
+
+    for (const operation of $PLAN$) {
+        if (operation.callbackDispatch !== null) {
+            const key = `${operation.callbackDispatch.callbackTypeId}:${operation.callbackDispatch.methodId}`;
+            if (callbackOperations.has(key)) throw new Error(`duplicate UniFFI callback method ${key}`);
+            callbackOperations.set(key, operation);
+        }
+        for (const group of operation.streamGroups) {
+            if (group.direction !== 'output') continue;
+            if (outputGroups.has(group.useSiteId)) throw new Error(`duplicate UniFFI output stream use-site ${group.useSiteId}`);
+            outputGroups.set(group.useSiteId, group);
+        }
+    }
+
+    function requireOpen() {
+        if (phase !== 'open') throw closedError();
+    }
+
+    function descriptor(operationId) {
+        if (!Number.isInteger(operationId) || operationId < 0 || operationId >= $PLAN$.length) {
+            throw new RangeError(`unknown UniFFI operation ${operationId}`);
+        }
+        return $PLAN$[operationId];
+    }
+
+    function validateArgs(operation, args) {
+        if (!Array.isArray(args)) throw new TypeError('UniFFI operation args must be an Array');
+        const implicit = operation.callbackDispatch !== null || operation.receiverResource !== null ? 1 : 0;
+        const expected = operation.argumentCount + implicit;
+        if (args.length !== expected) throw new TypeError(`UniFFI operation ${operation.operationId} expected ${expected} arguments, got ${args.length}`);
+    }
+
+    function valuesAtPath(args, result, path, receiverOffset) {
+        if (!Array.isArray(path) || path.length === 0) throw new TypeError('invalid empty UniFFI value path');
+        const root = path[0];
+        let values;
+        if (root.kind === 'argument') values = [args[root.value + receiverOffset]];
+        else if (root.kind === 'return') values = [result];
+        else throw new TypeError('invalid UniFFI value path root');
+        for (const segment of path.slice(1)) {
+            const next = [];
+            for (const value of values) {
+                if (segment.kind === 'optional') {
+                    if (value !== null && value !== undefined) next.push(value);
+                } else if (segment.kind === 'field') {
+                    if (value === null || typeof value !== 'object' || Array.isArray(value) || !Object.hasOwn(value, segment.value)) throw new TypeError(`invalid UniFFI field path segment ${segment.value}`);
+                    next.push(value[segment.value]);
+                } else if (segment.kind === 'variant') {
+                    if (value === null || typeof value !== 'object') throw new TypeError(`invalid UniFFI variant path segment ${segment.value}`);
+                    const tag = typeof value.tag === 'string' ? value.tag : null;
+                    if (tag === null) throw new TypeError(`missing UniFFI variant discriminant for ${segment.value}`);
+                    if (tag !== segment.value) throw new TypeError(`unexpected UniFFI variant ${tag}, expected ${segment.value}`);
+                    next.push(value);
+                } else if (segment.kind === 'sequenceItem') {
+                    if (!Array.isArray(value)) throw new TypeError('invalid UniFFI sequence path segment');
+                    next.push(...value);
+                } else if (segment.kind === 'setItem') {
+                    if (!(value instanceof Set)) throw new TypeError('invalid UniFFI set path segment');
+                    next.push(...value.values());
+                } else if (segment.kind === 'mapKey') {
+                    if (!(value instanceof Map)) throw new TypeError('invalid UniFFI map-key path segment');
+                    next.push(...value.keys());
+                } else if (segment.kind === 'mapValue') {
+                    if (!(value instanceof Map)) throw new TypeError('invalid UniFFI map-value path segment');
+                    next.push(...value.values());
+                } else {
+                    throw new TypeError(`unknown UniFFI value path segment ${String(segment.kind)}`);
+                }
+            }
+            values = next;
+        }
+        return values;
+    }
+
+    function registerCallback(typeId, callbackId, contract, scope) {
+        if (!Number.isInteger(callbackId) || callbackId <= 0) throw new TypeError('invalid UniFFI callback ID');
+        const key = callbackKey(typeId, callbackId);
+        let state = callbacks.get(key);
+        if (!state) {
+            state = { typeId, callbackId, depth: 0, scoped: 0, retained: false, forbidden: false };
+            callbacks.set(key, state);
+        }
+        state.forbidden ||= contract.reentrancy === 'forbidden';
+        if (contract.retention === 'retained') {
+            if (!state.retained) {
+                host.retainCallback(typeId, callbackId);
+                state.retained = true;
+                retainedCallbacks.set(key, state);
+                scope.newRetained.push(state);
+            }
+        } else {
+            state.scoped += 1;
+            scope.callbacks.push(state);
+        }
+    }
+
+    function rollbackRetainedCallbacks(scope) {
+        for (const state of scope.newRetained) {
+            if (!state.retained) continue;
+            state.retained = false;
+            retainedCallbacks.delete(callbackKey(state.typeId, state.callbackId));
+            host.releaseCallback(state.typeId, state.callbackId);
+            if (state.scoped === 0 && state.depth === 0) callbacks.delete(callbackKey(state.typeId, state.callbackId));
+        }
+        scope.newRetained.length = 0;
+    }
+
+    function releaseScopedCallbacks(scope) {
+        for (const state of scope) {
+            state.scoped = Math.max(0, state.scoped - 1);
+            if (!state.retained && state.scoped === 0 && state.depth === 0) callbacks.delete(callbackKey(state.typeId, state.callbackId));
+        }
+        scope.length = 0;
+    }
+
+    function registerInput(streamId, scope) {
+        if (!Number.isInteger(streamId) || streamId <= 0) throw new TypeError('invalid UniFFI input stream ID');
+        if (closedInputStreams.has(streamId)) throw new TypeError('released UniFFI input stream ID');
+        let state = inputStreams.get(streamId);
+        if (!state) {
+            state = { streamId, released: false, cancelStarted: false };
+            inputStreams.set(streamId, state);
+        }
+        if (!scope.includes(state)) scope.push(state);
+    }
+
+    async function finishInput(state, cancel, reason) {
+        if (!state || state.released) return;
+        if (cancel && !state.cancelStarted) {
+            state.cancelStarted = true;
+            try { await host.cancelInputStream(state.streamId, reason); }
+            finally {
+                if (!state.released) {
+                    state.released = true;
+                    inputStreams.delete(state.streamId);
+                    closedInputStreams.add(state.streamId);
+                    host.releaseInputStream(state.streamId);
+                }
+            }
+            return;
+        }
+        state.released = true;
+        inputStreams.delete(state.streamId);
+        closedInputStreams.add(state.streamId);
+        host.releaseInputStream(state.streamId);
+    }
+
+    function beginUseSites(operation, args) {
+        const receiverOffset = operation.receiverResource !== null ? 1 : 0;
+        const scope = { callbacks: [], newRetained: [], inputs: [] };
+        for (const useSite of operation.callbackUseSites) {
+            if (useSite.path[0]?.kind !== 'argument') continue;
+            for (const callbackId of valuesAtPath(args, undefined, useSite.path, receiverOffset)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
+        }
+        for (const group of operation.streamGroups) {
+            if (group.direction !== 'input' || group.path[0]?.kind !== 'argument') continue;
+            for (const streamId of valuesAtPath(args, undefined, group.path, receiverOffset)) registerInput(streamId, scope.inputs);
+        }
+        return scope;
+    }
+
+    function track(set, promise) {
+        const tracked = Promise.resolve(promise);
+        set.add(tracked);
+        tracked.finally(() => set.delete(tracked)).catch(() => {});
+        return tracked;
+    }
+
+    function unwrapLease(resource, expectedKind, expectedId, allowReleased = false) {
+        if (resource === null || typeof resource !== 'object' || resource.surfaceId !== 'base' || resource.generation !== generation) throw new TypeError('invalid or stale UniFFI resource lease');
+        if (allowReleased && releasedLeases.has(resource)) return null;
+        const table = expectedKind === 'object' ? objectLeases : outputLeases;
+        const state = table.get(resource.leaseId);
+        if (!state || state.lease !== resource || (!allowReleased && state.released) || (expectedId !== undefined && state.typeId !== expectedId)) throw new TypeError('invalid or released UniFFI resource lease');
+        return state;
+    }
+
+    function rawArguments(operation, args) {
+        const raw = args.slice();
+        if (operation.receiverResource?.kind === 'object') raw[0] = unwrapLease(args[0], 'object', operation.receiverResource.id).handle;
+        else if (operation.receiverResource?.kind === 'outputStream') raw[0] = unwrapLease(args[0], 'output', operation.receiverResource.id).handle;
+        else if (operation.receiverResource?.kind === 'inputStream') raw[0] = args[0]?.streamId ?? args[0];
+        return raw;
+    }
+
+    function makeLease(kind, typeId, handle, inputs) {
+        const lease = Object.freeze({ surfaceId: 'base', typeId, leaseId: nextLeaseId++, generation, handle });
+        const state = { lease, typeId, handle, released: false, cancelStarted: false, closeStarted: false, cancelPromise: null, closePromise: null, inputs: inputs.slice() };
+        (kind === 'object' ? objectLeases : outputLeases).set(lease.leaseId, state);
+        return lease;
+    }
+
+    async function invokeReleaseSlot(state) {
+        if (typeof $RESOURCE_HOOKS$.releaseObject !== 'function') throw new Error('missing UniFFI object release hook');
+        const result = $RESOURCE_HOOKS$.releaseObject(state.handle);
+        if (isThenable(result)) await result;
+    }
+
+    async function releaseObjectState(state) {
+        if (!state || state.released) return;
+        state.released = true;
+        releasedLeases.add(state.lease);
+        objectLeases.delete(state.lease.leaseId);
+        await invokeReleaseSlot(state);
+    }
+
+    function streamSlot(group, kind) {
+        const slot = group?.slots.find((candidate) => candidate.kind === kind);
+        if (!slot) throw new Error(`missing UniFFI ${kind} slot for output stream`);
+        return slot.operationId;
+    }
+
+    async function cancelOutputState(state, reason) {
+        if (!state || state.released) return;
+        if (state.cancelPromise !== null) return await state.cancelPromise;
+        state.cancelStarted = true;
+        state.cancelPromise = (async () => {
+            let failure;
+            try {
+                const operationId = streamSlot(outputGroups.get(state.typeId), 'outputStreamCancel');
+                const result = $TABLE$[operationId](state.handle);
+                if (!isThenable(result)) throw new TypeError(`async UniFFI operation ${operationId} did not return a thenable`);
+                await result;
+            } catch (error) { failure = error; }
+            await finishOutputState(state, true, reason);
+            if (failure !== undefined) throw failure;
+        })();
+        return await state.cancelPromise;
+    }
+
+    async function finishOutputState(state, cancelInputs = false, reason = undefined) {
+        if (!state) return;
+        if (state.closePromise !== null) return await state.closePromise;
+        state.closeStarted = true;
+        state.closePromise = (async () => {
+            let failure;
+            try {
+                if (typeof $RESOURCE_HOOKS$.closeOutputStream !== 'function') throw new Error('missing UniFFI output stream close hook');
+                const result = $RESOURCE_HOOKS$.closeOutputStream(state.handle);
+                if (isThenable(result)) await result;
+            } catch (error) { failure = error; }
+            state.released = true;
+            releasedLeases.add(state.lease);
+            outputLeases.delete(state.lease.leaseId);
+            await Promise.allSettled(state.inputs.map((input) => finishInput(input, cancelInputs, reason)));
+            if (failure !== undefined) throw failure;
+        })();
+        return await state.closePromise;
+    }
+
+    function validateStreamStep(raw) {
+        if (raw === null || typeof raw !== 'object' || typeof raw.kind !== 'string') throw new TypeError('invalid UniFFI StreamStep');
+        const keys = Object.keys(raw).sort().join(',');
+        if (raw.kind === 'item' && keys === 'kind,value') return raw;
+        if (raw.kind === 'done' && keys === 'kind') return raw;
+        if (raw.kind === 'error' && keys === 'error,kind') return raw;
+        throw new TypeError('invalid UniFFI StreamStep payload');
+    }
+
+    function callbackState(dispatch, callbackId) {
+        const state = callbacks.get(callbackKey(dispatch.callbackTypeId, callbackId));
+        if (!state) throw new Error(`unknown UniFFI callback ${dispatch.callbackTypeId}:${callbackId}`);
+        if (state.forbidden && state.depth !== 0) throw new Error('forbidden UniFFI callback reentrancy');
+        return state;
+    }
+
+    function callbackFailure(operation, error) {
+        if (operation.fallible) return error;
+        const message = error instanceof Error ? error.message : String(error);
+        return new Error(`infallible UniFFI callback failed: ${message}`, { cause: error });
+    }
+
+    function invokeCallbackSync(operation, args) {
+        const [callbackId, ...methodArgs] = args;
+        return invokeCallbackHostSync(operation, callbackId, methodArgs);
+    }
+
+    function invokeCallbackHostSync(operation, callbackId, methodArgs) {
+        const state = callbackState(operation.callbackDispatch, callbackId);
+        state.depth += 1;
+        try {
+            const result = host.invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, methodArgs);
+            if (isThenable(result)) throw new TypeError('sync UniFFI callback returned a thenable');
+            return result;
+        } catch (error) {
+            throw callbackFailure(operation, error);
+        } finally { state.depth -= 1; }
+    }
+
+    async function invokeCallbackAsync(operation, args) {
+        const [callbackId, ...methodArgs] = args;
+        return await invokeCallbackHostAsync(operation, callbackId, methodArgs);
+    }
+
+    async function invokeCallbackHostAsync(operation, callbackId, methodArgs) {
+        const state = callbackState(operation.callbackDispatch, callbackId);
+        state.depth += 1;
+        try {
+            const result = host.invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, nextInvocationId++, methodArgs);
+            if (!isThenable(result)) throw new TypeError('async UniFFI callback did not return a thenable');
+            return await result;
+        } catch (error) {
+            throw callbackFailure(operation, error);
+        } finally { state.depth -= 1; }
+    }
+
+    async function invokeInputHost(operation, args) {
+        const streamId = args[0]?.streamId ?? args[0];
+        return operation.kind === 'inputStreamCancel' ? await cancelInputHost(streamId) : await pullInputHost(streamId);
+    }
+
+    async function pullInputHost(streamId) {
+        if (closedInputStreams.has(streamId)) {
+            return { kind: 'done' };
+        }
+        let state = inputStreams.get(streamId);
+        if (!state) {
+            state = { streamId, released: false, cancelStarted: false };
+            inputStreams.set(streamId, state);
+        }
+        const raw = host.pullInputStream(streamId);
+        if (!isThenable(raw)) throw new TypeError('Host.pullInputStream() must return a Promise');
+        const step = validateStreamStep(await raw);
+        if (state.released || state.cancelStarted) return { kind: 'done' };
+        if (step.kind !== 'item') await finishInput(state, false);
+        return step;
+    }
+
+    async function cancelInputHost(streamId) {
+        if (closedInputStreams.has(streamId)) return;
+        let state = inputStreams.get(streamId);
+        if (!state) {
+            state = { streamId, released: false, cancelStarted: false };
+            inputStreams.set(streamId, state);
+        }
+        await finishInput(state, true);
+    }
+
+    const engineHost = Object.freeze({
+        invokeCallbackSync(callbackTypeId, callbackId, methodId, args) {
+            if (!Array.isArray(args)) throw new TypeError('UniFFI callback args must be an Array');
+            const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
+            if (!operation || operation.asyncKind !== 'sync') throw new Error(`unknown sync UniFFI callback method ${callbackTypeId}:${methodId}`);
+            return invokeCallbackHostSync(operation, callbackId, args);
+        },
+        invokeCallbackAsync(callbackTypeId, callbackId, methodId, args) {
+            if (!Array.isArray(args)) return Promise.reject(new TypeError('UniFFI callback args must be an Array'));
+            const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
+            if (!operation || operation.asyncKind !== 'async') return Promise.reject(new Error(`unknown async UniFFI callback method ${callbackTypeId}:${methodId}`));
+            return invokeCallbackHostAsync(operation, callbackId, args);
+        },
+        pullInputStream: pullInputHost,
+        cancelInputStream: cancelInputHost,
+    });
+
+    function invokeRaw(operation, args) {
+        const raw = rawArguments(operation, args);
+        if (operation.hostArgument) raw.unshift(engineHost);
+        return $TABLE$[operation.operationId](...raw);
+    }
+
+    function finishSync(operation, args, scope, result, callGeneration) {
+        try {
+            if (phase !== 'open' || generation !== callGeneration) throw closedError();
+            if (operation.returnResource?.kind === 'object') result = makeLease('object', operation.returnResource.id, result, []);
+            if (operation.returnResource?.kind === 'outputStream') result = makeLease('output', operation.returnResource.id, result, scope.inputs);
+            for (const useSite of operation.callbackUseSites) {
+                if (useSite.path[0]?.kind !== 'return') continue;
+                for (const callbackId of valuesAtPath(args, result, useSite.path, 0)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
+            }
+            if (operation.returnResource?.kind !== 'outputStream') for (const input of scope.inputs) track(cleanup, finishInput(input, false));
+            return result;
+        } finally { releaseScopedCallbacks(scope.callbacks); }
+    }
+
+    async function finishAsync(operation, args, scope, result, callGeneration) {
+        try {
+            if (operation.kind === 'outputStreamNext') {
+                const state = unwrapLease(args[0], 'output', operation.streamSlot.useSiteId);
+                if (state.cancelStarted || state.closeStarted) return { kind: 'done' };
+                const step = validateStreamStep(result);
+                if (step.kind !== 'item') await finishOutputState(state);
+                return step;
+            }
+            if (operation.kind === 'outputStreamCancel') {
+                await finishOutputState(unwrapLease(args[0], 'output', operation.streamSlot.useSiteId));
+                return undefined;
+            }
+            if (operation.returnResource?.kind === 'object') {
+                if (phase !== 'open' || generation !== callGeneration) {
+                    await invokeReleaseSlot({ typeId: operation.returnResource.id, handle: result });
+                    throw closedError();
+                }
+                result = makeLease('object', operation.returnResource.id, result, []);
+            }
+            if (operation.returnResource?.kind === 'outputStream') {
+                if (phase !== 'open' || generation !== callGeneration) {
+                    const operationId = streamSlot(outputGroups.get(operation.returnResource.id), 'outputStreamCancel');
+                    try { await $TABLE$[operationId](result); }
+                    finally {
+                        if (typeof $RESOURCE_HOOKS$.closeOutputStream === 'function') await $RESOURCE_HOOKS$.closeOutputStream(result);
+                    }
+                    throw closedError();
+                }
+                result = makeLease('output', operation.returnResource.id, result, scope.inputs);
+            }
+            for (const useSite of operation.callbackUseSites) {
+                if (useSite.path[0]?.kind !== 'return') continue;
+                for (const callbackId of valuesAtPath(args, result, useSite.path, 0)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
+            }
+            if (operation.returnResource?.kind !== 'outputStream') await Promise.allSettled(scope.inputs.map((input) => finishInput(input, false)));
+            if (phase !== 'open' || generation !== callGeneration) throw closedError();
+            return result;
+        } finally { releaseScopedCallbacks(scope.callbacks); }
+    }
+
+    function invokeSync(operationId, args) {
+        requireOpen();
+        const operation = descriptor(operationId);
+        if (operation.asyncKind !== 'sync') throw new TypeError(`UniFFI operation ${operationId} is asynchronous`);
+        validateArgs(operation, args);
+        if (operation.callbackDispatch !== null) return invokeCallbackSync(operation, args);
+        const scope = beginUseSites(operation, args);
+        try {
+            const result = invokeRaw(operation, args);
+            if (isThenable(result)) throw new TypeError(`sync UniFFI operation ${operationId} returned a thenable`);
+            return finishSync(operation, args, scope, result, generation);
+        } catch (error) {
+            rollbackRetainedCallbacks(scope);
+            releaseScopedCallbacks(scope.callbacks);
+            for (const input of scope.inputs) track(cleanup, finishInput(input, true, error));
+            throw error;
+        }
+    }
+
+    function invokeAsync(operationId, args) {
+        requireOpen();
+        const operation = descriptor(operationId);
+        if (operation.asyncKind !== 'async') throw new TypeError(`UniFFI operation ${operationId} is synchronous`);
+        validateArgs(operation, args);
+        const callGeneration = generation;
+        const scope = beginUseSites(operation, args);
+        const execution = (async () => {
+            try {
+                let result;
+                if (operation.callbackDispatch !== null) result = await invokeCallbackAsync(operation, args);
+                else if (operation.kind === 'inputStreamPull' || operation.kind === 'inputStreamCancel') result = await invokeInputHost(operation, args);
+                else {
+                    const raw = invokeRaw(operation, args);
+                    if (!isThenable(raw)) throw new TypeError(`async UniFFI operation ${operationId} did not return a thenable`);
+                    result = await raw;
+                }
+                return await finishAsync(operation, args, scope, result, callGeneration);
+            } catch (error) {
+                rollbackRetainedCallbacks(scope);
+                releaseScopedCallbacks(scope.callbacks);
+                if (operation.kind === 'outputStreamNext') {
+                    try { await cancelOutputState(unwrapLease(args[0], 'output', operation.streamSlot.useSiteId), error); } catch {}
+                }
+                await Promise.allSettled(scope.inputs.map((input) => finishInput(input, true, error)));
+                throw error;
+            }
+        })();
+        return track(pending, execution);
+    }
+
+    function releaseObject(resource) {
+        track(cleanup, releaseObjectState(unwrapLease(resource, 'object', resource?.typeId, true)));
+    }
+
+    function cancelOutputStream(resource) {
+        return track(cleanup, cancelOutputState(unwrapLease(resource, 'output', resource?.typeId, true)));
+    }
+
+    function releaseOutputStream(resource) {
+        track(cleanup, finishOutputState(unwrapLease(resource, 'output', resource?.typeId, true)));
+    }
+
+    function close() {
+        if (closePromise !== null) return closePromise;
+        phase = 'closing';
+        generation += 1;
+        closePromise = (async () => {
+            for (const state of Array.from(outputLeases.values())) track(cleanup, cancelOutputState(state));
+            for (const state of Array.from(objectLeases.values())) track(cleanup, releaseObjectState(state));
+            for (const state of Array.from(inputStreams.values())) track(cleanup, finishInput(state, true));
+            while (pending.size !== 0) await Promise.allSettled([...pending]);
+            for (const state of retainedCallbacks.values()) {
+                if (state.retained) {
+                    state.retained = false;
+                    host.releaseCallback(state.typeId, state.callbackId);
+                }
+            }
+            retainedCallbacks.clear();
+            while (cleanup.size !== 0) await Promise.allSettled([...cleanup]);
+            callbacks.clear();
+            objectLeases.clear();
+            outputLeases.clear();
+            phase = 'closed';
+        })();
+        return closePromise;
+    }
+
+    return Object.freeze({
+        info: Object.freeze({ engine: 'wasm-bindgen', surfaceId: 'base', operationCount: $PLAN$.length }),
+        invokeSync,
+        invokeAsync,
+        releaseObject,
+        cancelOutputStream,
+        releaseOutputStream,
+        close,
+    });
+}
+"#;
+    let plan_identifier = format!("{factory_identifier}_plan");
+    TEMPLATE
+        .replace("$TABLE$", table_identifier)
+        .replace("$OPERATIONS$", &operation_identifiers.join(", "))
+        .replace("$PLAN$", &plan_identifier)
+        .replace("$METADATA$", metadata)
+        .replace(
+            "$RELEASE_OBJECT$",
+            release_object_identifier.unwrap_or("null"),
+        )
+        .replace(
+            "$CLOSE_OUTPUT_STREAM$",
+            close_output_stream_identifier.unwrap_or("null"),
+        )
+        .replace(
+            "$RESOURCE_HOOKS$",
+            &format!("{factory_identifier}_resource_hooks"),
+        )
+        .replace("$FACTORY$", factory_identifier)
+}
+
 /// Files produced by `Context::finalize`.
 pub struct FinalizedOutput {
     pub js: String,
@@ -2783,6 +3364,27 @@ if (require('worker_threads').isMainThread) {{
             };
             operation_identifiers.push(definition.identifier.clone());
         }
+        let resolve_resource_export =
+            |name: Option<&str>, role: &str| -> Result<Option<String>, Error> {
+                let Some(name) = name else {
+                    return Ok(None);
+                };
+                let entry = self.exports.get(name).with_context(|| {
+                    format!("UniFFI {role} references missing raw export `{name}`")
+                })?;
+                let ExportEntry::Definition(definition) = entry else {
+                    bail!("UniFFI {role} `{name}` must be a flat function export");
+                };
+                Ok(Some(definition.identifier.clone()))
+            };
+        let release_object_identifier = resolve_resource_export(
+            config.resource_exports().release_object_export_name(),
+            "object release hook",
+        )?;
+        let close_output_stream_identifier = resolve_resource_export(
+            config.resource_exports().close_output_stream_export_name(),
+            "output stream close hook",
+        )?;
 
         // The backend owns the complete generated surface.  Hide every raw
         // wasm-bindgen API definition, including an accidentally unlisted one,
@@ -2812,24 +3414,14 @@ if (require('worker_threads').isMainThread) {{
             self.generate_identifier(&format!("{}_impl", config.factory_export_name()));
         let table_identifier =
             self.generate_identifier(&format!("{}_operations", config.factory_export_name()));
-        let operation_count = operation_identifiers.len();
-        let definition = format!(
-            "const {table_identifier} = Object.freeze([{operations}]);\n\
-             function {factory_identifier}() {{\n\
-                 if ({table_identifier}.length !== {operation_count} || {table_identifier}.some((operation) => typeof operation !== 'function')) {{\n\
-                     throw new Error('incomplete UniFFI wasm backend operation table');\n\
-                 }}\n\
-                 return Object.freeze({{\n\
-                     operationCount: {operation_count},\n\
-                     call(operationId, ...args) {{\n\
-                         if (!Number.isInteger(operationId) || operationId < 0 || operationId >= {table_identifier}.length) {{\n\
-                             throw new RangeError(`unknown UniFFI operation ${{operationId}}`);\n\
-                         }}\n\
-                         return {table_identifier}[operationId](...args);\n\
-                     }}\n\
-                 }});\n\
-             }}\n",
-            operations = operation_identifiers.join(", "),
+        let metadata = config.operation_metadata_json()?;
+        let definition = uniffi_backend_session_definition(
+            &factory_identifier,
+            &table_identifier,
+            &operation_identifiers,
+            &metadata,
+            release_object_identifier.as_deref(),
+            close_output_stream_identifier.as_deref(),
         );
         self.exports.insert(
             config.factory_export_name().to_owned(),
@@ -7719,7 +8311,10 @@ fn write_es_import(dest: &mut String, module: &str, items: &[(String, Option<Str
 #[cfg(test)]
 mod uniffi_surface_tests {
     use super::*;
-    use crate::{BindingSurface, UniFfiBackendConfig, UniFfiBackendOperation};
+    use crate::{
+        BindingSurface, UniFfiBackendAsyncKind, UniFfiBackendCarrier, UniFfiBackendConfig,
+        UniFfiBackendOperation, UniFfiBackendOperationKind, UniFfiBackendResourceExports,
+    };
 
     #[test]
     fn raw_operations_are_private_and_only_factory_is_exported() {
@@ -7729,7 +8324,17 @@ mod uniffi_surface_tests {
             .binding_surface(BindingSurface::UniFfiBackend(
                 UniFfiBackendConfig::new(
                     "__uniffi_backend_factory",
-                    vec![UniFfiBackendOperation::new(0, "__uniffi_op_0").unwrap()],
+                    vec![UniFfiBackendOperation::new(
+                        0,
+                        "__uniffi_op_0",
+                        UniFfiBackendAsyncKind::Sync,
+                        UniFfiBackendOperationKind::Function,
+                        false,
+                        vec![UniFfiBackendCarrier::Primitive],
+                        Some(UniFfiBackendCarrier::Primitive),
+                    )
+                    .unwrap()],
+                    UniFfiBackendResourceExports::default(),
                 )
                 .unwrap(),
             ));
@@ -7757,6 +8362,12 @@ mod uniffi_surface_tests {
             .globals
             .contains("export { __uniffi_backend_factory_impl as __uniffi_backend_factory }"));
         assert!(cx.globals.contains("Object.freeze"));
+        assert!(cx
+            .globals
+            .contains("function __uniffi_backend_factory_impl(host)"));
+        assert!(cx.globals.contains("invokeSync"));
+        assert!(cx.globals.contains("invokeAsync"));
+        assert!(!cx.globals.contains("call(operationId"));
         assert_eq!(cx.export_name_list, ["__uniffi_backend_factory"]);
         assert!(!cx.typescript.contains("__uniffi_op_0"));
     }

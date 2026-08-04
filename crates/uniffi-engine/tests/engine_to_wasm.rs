@@ -34,15 +34,23 @@ fn engine_plan() -> WasmEnginePlan {
         fallible,
     };
 
-    WasmEnginePlan::build(vec![
-        operation(
-            0,
-            "a_roundtrip",
-            vec![WasmCarrier::String, WasmCarrier::Bytes],
-            Some(WasmCarrier::String),
-            WasmAsyncKind::Sync,
-            false,
-        ),
+    let mut operations = vec![WasmOperationPlan {
+        operation_id: 0,
+        // Compile a path containing both the legal `crate` root and raw
+        // identifiers.  This keeps raw-name handling covered by the real
+        // wasm32 fixture rather than only by token-string assertions.
+        rust_call: RustPath::new([
+            "crate".to_owned(),
+            "r#type".to_owned(),
+            "r#Trait".to_owned(),
+        ])
+        .unwrap(),
+        arguments: vec![WasmCarrier::String, WasmCarrier::Bytes],
+        return_carrier: Some(WasmCarrier::String),
+        async_kind: WasmAsyncKind::Sync,
+        fallible: false,
+    }];
+    operations.extend([
         operation(
             1,
             "b_async_bytes",
@@ -91,8 +99,8 @@ fn engine_plan() -> WasmEnginePlan {
             WasmAsyncKind::Async,
             true,
         ),
-    ])
-    .unwrap()
+    ]);
+    WasmEnginePlan::build(operations).unwrap()
 }
 
 fn fixture_source(plan: &WasmEnginePlan) -> String {
@@ -155,6 +163,12 @@ mod fixture {{
         }} else {{
             Ok(format!("async-fallible:{{text}}"))
         }}
+    }}
+}}
+
+mod r#type {{
+    pub fn r#Trait(text: String, bytes: Vec<u8>) -> String {{
+        format!("{{text}}:{{}}", bytes.iter().copied().map(u32::from).sum::<u32>())
     }}
 }}
 

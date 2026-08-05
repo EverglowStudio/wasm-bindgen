@@ -1669,13 +1669,17 @@ fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
     let sync_fallible = tokens(2);
     assert!(sync_fallible.contains("pub fn"));
     assert!(sync_fallible.contains("-> Result < String"));
-    let async_infallible = tokens(7);
-    assert!(async_infallible.contains("pub async fn"));
-    assert!(async_infallible.contains("-> String {"));
-    assert!(!async_infallible.contains("-> Result < String"));
     let async_fallible = tokens(3);
     assert!(async_fallible.contains("pub async fn"));
     assert!(async_fallible.contains("-> Result < String"));
+    for host_operation in [5, 6, 7, 8, 10, 11] {
+        assert!(
+            expanded
+                .iter()
+                .all(|operation| operation.operation_id != host_operation),
+            "host-dispatched operation {host_operation} must not expand a Rust raw shim"
+        );
+    }
 
     let cargo = tool_path("cargo");
     let rustc = tool_path("rustc");

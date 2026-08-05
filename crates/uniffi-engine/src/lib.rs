@@ -239,6 +239,22 @@ pub enum WasmOperationKind {
     InputStreamCancel,
 }
 
+/// Dispatch class for a canonical Wasm operation.  `HostDispatched` entries
+/// are represented in the UniFFI backend descriptor table but intentionally
+/// do not expand a Rust/wasm-bindgen raw shim; the JavaScript session owns the
+/// callback or foreign-input-stream protocol for those IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmOperationDispatch {
+    NativeCall,
+    HostDispatched,
+}
+
+impl WasmOperationDispatch {
+    fn is_host_dispatched(self) -> bool {
+        matches!(self, Self::HostDispatched)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WasmOwnership {
     Borrowed,
@@ -614,6 +630,24 @@ pub struct WasmOperationPlan {
 }
 
 impl WasmOperationPlan {
+    /// Return the dispatch class without requiring callers to duplicate the
+    /// callback/input-stream target matrix.
+    pub fn dispatch(&self) -> WasmOperationDispatch {
+        match (&self.call_target, self.kind) {
+            (WasmCallTarget::CallbackMethod { .. }, WasmOperationKind::CallbackMethod)
+            | (
+                WasmCallTarget::StreamHook {
+                    hook: WasmResourceHook::PullInputStream | WasmResourceHook::CancelInputStream,
+                    ..
+                },
+                WasmOperationKind::InputStreamPull | WasmOperationKind::InputStreamCancel,
+            ) => WasmOperationDispatch::HostDispatched,
+            _ => WasmOperationDispatch::NativeCall,
+        }
+    }
+}
+
+impl WasmOperationPlan {
     pub fn fallible(&self) -> bool {
         self.throws.is_some()
     }
@@ -754,6 +788,7 @@ impl WasmEnginePlan {
         let builder = ExpansionBuilder::new(context);
         self.operations
             .iter()
+            .filter(|operation| !operation.plan.dispatch().is_host_dispatched())
             .map(|operation| expand_operation(&builder, operation))
             .collect()
     }
@@ -1285,6 +1320,14 @@ fn backend_config(
                     .map(|binding| backend_carrier(binding.carrier)),
             )
             .map(|backend| {
+                let backend = backend.with_dispatch(match operation.plan.dispatch() {
+                    WasmOperationDispatch::NativeCall => {
+                        wasm_bindgen_cli_support::UniFfiBackendDispatch::NativeCall
+                    }
+                    WasmOperationDispatch::HostDispatched => {
+                        wasm_bindgen_cli_support::UniFfiBackendDispatch::HostDispatched
+                    }
+                });
                 let backend = if let Some((callback_type_id, method_id)) = callback_dispatch {
                     backend.with_callback_dispatch(callback_type_id, method_id)
                 } else {
@@ -1827,6 +1870,42 @@ mod tests {
         assert!(tokens.contains("WasmDescribe"));
         assert!(tokens.contains("__wbindgen_describe"));
         assert!(!tokens.contains("compile_error"));
+    }
+
+    #[test]
+    fn host_dispatched_callback_has_no_rust_raw_expansion() {
+        let mut callback = operation(0);
+        callback.source_key.kind = WasmOperationKind::CallbackMethod;
+        let callback_owner = WasmTypeSourceKey {
+            component: "fixture".to_owned(),
+            name: "Listener".to_owned(),
+        };
+        callback.source_key.owner = WasmOperationOwner::Callback(callback_owner.clone());
+        callback.owner = WasmOperationOwner::Callback(callback_owner);
+        callback.kind = WasmOperationKind::CallbackMethod;
+        callback.callback_method_id = Some(0);
+        callback.call_target = WasmCallTarget::CallbackMethod {
+            callback: RustPath::new(["fixture".to_owned(), "Listener".to_owned()]).unwrap(),
+            callback_type_id: 7,
+            method_id: 0,
+            item: "on_value".to_owned(),
+        };
+        callback.arguments.clear();
+        callback.return_value = None;
+        let plan = WasmEnginePlan::build(policy(), vec![callback]).unwrap();
+        assert_eq!(
+            plan.operations[0].plan.dispatch(),
+            WasmOperationDispatch::HostDispatched
+        );
+        let context = ExpansionContext::new(
+            std::env::current_dir().unwrap(),
+            "fixture",
+            "1.0.0",
+            Vec::<String>::new(),
+            "wasm32-unknown-unknown",
+        )
+        .unwrap();
+        assert!(plan.expand(context).unwrap().is_empty());
     }
 
     #[test]

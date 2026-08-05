@@ -232,6 +232,17 @@ pub struct UniFfiBackendCallbackDispatch {
     pub method_id: u32,
 }
 
+/// Whether an operation has a Rust wasm-bindgen shim or is dispatched wholly
+/// by the UniFFI host/session runtime.  Host-dispatched entries still occupy
+/// their canonical operation ID and descriptor slot, but deliberately have no
+/// executable raw export in the generated wasm module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendDispatch {
+    NativeCall,
+    HostDispatched,
+}
+
 /// One raw operation exposed only through the UniFFI backend table.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -245,6 +256,7 @@ pub struct UniFfiBackendOperation {
     argument_count: usize,
     argument_carriers: Vec<UniFfiBackendCarrier>,
     return_carrier: Option<UniFfiBackendCarrier>,
+    dispatch: UniFfiBackendDispatch,
     host_argument: bool,
     callback_dispatch: Option<UniFfiBackendCallbackDispatch>,
     callback_use_sites: Vec<UniFfiBackendCallbackUseSite>,
@@ -279,6 +291,7 @@ impl UniFfiBackendOperation {
             argument_count,
             argument_carriers,
             return_carrier,
+            dispatch: UniFfiBackendDispatch::NativeCall,
             host_argument: false,
             callback_dispatch: None,
             callback_use_sites: Vec::new(),
@@ -295,6 +308,11 @@ impl UniFfiBackendOperation {
             callback_type_id,
             method_id,
         });
+        self
+    }
+
+    pub fn with_dispatch(mut self, dispatch: UniFfiBackendDispatch) -> Self {
+        self.dispatch = dispatch;
         self
     }
 
@@ -345,6 +363,10 @@ impl UniFfiBackendOperation {
 
     pub fn raw_export_name(&self) -> &str {
         &self.raw_export_name
+    }
+
+    pub fn dispatch(&self) -> UniFfiBackendDispatch {
+        self.dispatch
     }
 
     pub fn has_receiver(&self) -> bool {
@@ -477,10 +499,14 @@ impl UniFfiBackendConfig {
                     operation.operation_id
                 );
             }
-            if operation.raw_export_name == factory_export_name {
+            if operation.dispatch == UniFfiBackendDispatch::NativeCall
+                && operation.raw_export_name == factory_export_name
+            {
                 bail!("UniFFI backend factory name collides with a raw operation export");
             }
-            if !names.insert(operation.raw_export_name.clone()) {
+            if operation.dispatch == UniFfiBackendDispatch::NativeCall
+                && !names.insert(operation.raw_export_name.clone())
+            {
                 bail!(
                     "duplicate UniFFI raw operation export `{}`",
                     operation.raw_export_name
@@ -566,6 +592,18 @@ fn validate_uniffi_backend_operation(
     if callback_target && operation.host_argument {
         bail!(
             "UniFFI callback Host operation {} cannot also receive the engine Host argument",
+            operation.operation_id
+        );
+    }
+    if operation.dispatch == UniFfiBackendDispatch::HostDispatched && operation.host_argument {
+        bail!(
+            "UniFFI host-dispatched operation {} cannot also receive the engine Host argument",
+            operation.operation_id
+        );
+    }
+    if callback_target && operation.dispatch != UniFfiBackendDispatch::HostDispatched {
+        bail!(
+            "UniFFI callback operation {} must be host-dispatched",
             operation.operation_id
         );
     }

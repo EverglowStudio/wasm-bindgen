@@ -89,7 +89,7 @@ const $PLAN$ = Object.freeze($METADATA$);
 const $CLOSE_POLICY$ = Object.freeze({ graceMs: $GRACE_MS$, onDeadline: 'detach' });
 const $RESOURCE_HOOKS$ = Object.freeze({ releaseObject: $RELEASE_OBJECT$, closeOutputStream: $CLOSE_OUTPUT_STREAM$ });
 function $FACTORY$(host) {
-    if ($TABLE$.length !== $PLAN$.length || $TABLE$.some((operation) => typeof operation !== 'function')) {
+    if ($TABLE$.length !== $PLAN$.length || $TABLE$.some((operation, index) => $PLAN$[index].dispatch !== 'hostDispatched' && typeof operation !== 'function')) {
         throw new Error('incomplete UniFFI wasm backend operation table');
     }
     if (host === null || typeof host !== 'object') {
@@ -3622,6 +3622,10 @@ if (require('worker_threads').isMainThread) {{
 
         let mut operation_identifiers = Vec::with_capacity(config.operations().len());
         for operation in config.operations() {
+            if operation.dispatch() == crate::UniFfiBackendDispatch::HostDispatched {
+                operation_identifiers.push("null".to_owned());
+                continue;
+            }
             let entry = self
                 .exports
                 .get(operation.raw_export_name())

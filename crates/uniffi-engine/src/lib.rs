@@ -27,7 +27,12 @@ use wasm_bindgen_cli_support::{
     UniFfiBackendResourceUseSite, UniFfiBackendStreamDirection, UniFfiBackendStreamGroup,
     UniFfiBackendStreamSlot, UniFfiBackendValuePath, UniFfiBackendValuePathSegment,
 };
-use wasm_bindgen_macro_support::{ExpansionBuilder, ExpansionContext};
+use wasm_bindgen_macro_support::ExpansionBuilder;
+/// Explicit context required by the public in-process expansion methods.
+///
+/// Re-exporting the type keeps consumers on the engine boundary; they do not
+/// need to depend on the macro-support implementation crate directly.
+pub use wasm_bindgen_macro_support::ExpansionContext;
 
 /// Engine-owned projection of the canonical UniFFI teardown policy.  The
 /// definition lives in cli-support because the generated JS session consumes

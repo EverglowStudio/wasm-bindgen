@@ -232,6 +232,15 @@ function $FACTORY$(host) {
             if (tag !== segment.value) return value;
             return rewriteResourceValue(value, rest, transform);
         }
+        if (segment.kind === 'streamItem' || segment.kind === 'streamError') {
+            const step = validateStreamStep(value);
+            const expectedKind = segment.kind === 'streamItem' ? 'item' : 'error';
+            if (step.kind !== expectedKind) return value;
+            const clone = Object.assign(Object.create(Object.getPrototypeOf(step)), step);
+            const key = expectedKind === 'item' ? 'value' : 'error';
+            clone[key] = rewriteResourceValue(step[key], rest, transform);
+            return clone;
+        }
         if (segment.kind === 'sequenceItem') {
             if (!Array.isArray(value)) throw new TypeError('invalid UniFFI sequence resource path segment');
             return value.map((item) => rewriteResourceValue(item, rest, transform));
@@ -736,7 +745,11 @@ function $FACTORY$(host) {
             if (operation.kind === 'outputStreamNext') {
                 if (phase !== 'open') throw closedError();
                 const state = unwrapLease(args[0], 'output', operation.streamSlot.useSiteId);
-                if (state.cancelStarted || state.closeStarted) return { kind: 'done' };
+                if (state.cancelStarted || state.closeStarted) {
+                    await releaseRawReturnResources(operation, result);
+                    return { kind: 'done' };
+                }
+                result = wrapReturnResources(operation, result, scope);
                 const step = validateStreamStep(result);
                 if (step.kind !== 'item') await finishOutputState(state);
                 return step;

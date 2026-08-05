@@ -81,6 +81,10 @@ pub enum UniFfiBackendValuePathSegment {
     /// path walker to receivers and ordinary arguments.
     Receiver,
     Return,
+    /// Select the `value` payload of a canonical output stream `item` step.
+    StreamItem,
+    /// Select the `error` payload of a canonical output stream `error` step.
+    StreamError,
     Field(String),
     Variant(String),
     Optional,
@@ -628,6 +632,20 @@ fn validate_uniffi_backend_operation(
             );
         }
         let root = use_site.path.segments().first().expect("checked above");
+        let is_return = matches!(root, UniFfiBackendValuePathSegment::Return);
+        for (index, segment) in use_site.path.segments().iter().skip(1).enumerate() {
+            if matches!(
+                segment,
+                UniFfiBackendValuePathSegment::StreamItem
+                    | UniFfiBackendValuePathSegment::StreamError
+            ) && (!is_return || index != 0)
+            {
+                bail!(
+                    "UniFFI stream step resource path for operation {} must start at Return",
+                    operation.operation_id
+                );
+            }
+        }
         match root {
             UniFfiBackendValuePathSegment::Receiver if !operation.has_receiver => bail!(
                 "UniFFI object resource receiver path is invalid for operation {}",
@@ -664,7 +682,6 @@ fn validate_uniffi_backend_operation(
                 operation.operation_id
             );
         }
-        let is_return = matches!(root, UniFfiBackendValuePathSegment::Return);
         let expected = if is_return {
             UniFfiBackendResourceOwnership::Owned
         } else {

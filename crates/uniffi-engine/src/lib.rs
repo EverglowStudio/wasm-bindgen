@@ -438,6 +438,18 @@ pub enum WasmValuePathSegment {
     Argument(u32),
     Receiver,
     Return,
+    /// Select the `value` payload of a canonical output stream `item` step.
+    ///
+    /// This segment is only valid immediately below a `Return` root on an
+    /// output-stream-next operation.  Keeping it in the canonical path
+    /// model means object resources in stream items use the same metadata and
+    /// lease walker as ordinary operation returns.
+    StreamItem,
+    /// Select the `error` payload of a canonical output stream `error` step.
+    ///
+    /// This segment is only valid immediately below a `Return` root on an
+    /// output-stream-next operation.
+    StreamError,
     Field(String),
     Variant(String),
     Optional,
@@ -891,6 +903,20 @@ fn validate_executable_plan(operations: &mut [ValidatedOperation]) -> Result<(),
                 )));
             }
             let root = use_site.path.segments().first().expect("validated path");
+            let is_return = matches!(root, WasmValuePathSegment::Return);
+            for (index, segment) in use_site.path.segments().iter().skip(1).enumerate() {
+                if matches!(
+                    segment,
+                    WasmValuePathSegment::StreamItem | WasmValuePathSegment::StreamError
+                ) {
+                    if !is_return || index != 0 {
+                        return Err(EngineError::InvalidPlan(format!(
+                            "stream step resource path in operation {} must start at Return",
+                            operation.plan.operation_id
+                        )));
+                    }
+                }
+            }
             let (binding_ownership, conversion, expected_ownership) = match root {
                 WasmValuePathSegment::Receiver => {
                     let Some(receiver) = operation.plan.receiver.as_ref() else {
@@ -1479,6 +1505,8 @@ fn backend_path(path: &WasmValuePath) -> UniFfiBackendValuePath {
                 }
                 WasmValuePathSegment::Receiver => UniFfiBackendValuePathSegment::Receiver,
                 WasmValuePathSegment::Return => UniFfiBackendValuePathSegment::Return,
+                WasmValuePathSegment::StreamItem => UniFfiBackendValuePathSegment::StreamItem,
+                WasmValuePathSegment::StreamError => UniFfiBackendValuePathSegment::StreamError,
                 WasmValuePathSegment::Field(name) => {
                     UniFfiBackendValuePathSegment::Field(name.clone())
                 }

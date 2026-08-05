@@ -47,7 +47,7 @@ once_cell = { version = "1.12", default-features = false }
 serde = { version = "1.0", optional = true }
 serde_json = { version = "1.0", optional = true }
 wasm-bindgen-macro = { path = "crates/macro", version = "=0.2.126" }
-wasm-bindgen-shared = { path = "crates/shared", version = "=0.2.126" }
+wasm-bindgen-shared = "=0.2.126"
 
 [build-dependencies]
 # In older MSRVs, dependencies and crate features can't have the same name.

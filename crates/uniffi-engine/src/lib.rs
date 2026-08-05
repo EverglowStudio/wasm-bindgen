@@ -909,9 +909,12 @@ fn validate_executable_plan(operations: &mut [ValidatedOperation]) -> Result<(),
                     segment,
                     WasmValuePathSegment::StreamItem | WasmValuePathSegment::StreamError
                 ) {
-                    if !is_return || index != 0 {
+                    if !is_return
+                        || index != 0
+                        || operation.plan.kind != WasmOperationKind::OutputStreamNext
+                    {
                         return Err(EngineError::InvalidPlan(format!(
-                            "stream step resource path in operation {} must start at Return",
+                            "stream step resource path in operation {} must belong to OutputStreamNext and start at Return",
                             operation.plan.operation_id
                         )));
                     }

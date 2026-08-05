@@ -638,10 +638,12 @@ fn validate_uniffi_backend_operation(
                 segment,
                 UniFfiBackendValuePathSegment::StreamItem
                     | UniFfiBackendValuePathSegment::StreamError
-            ) && (!is_return || index != 0)
+            ) && (!is_return
+                || index != 0
+                || operation.kind != UniFfiBackendOperationKind::OutputStreamNext)
             {
                 bail!(
-                    "UniFFI stream step resource path for operation {} must start at Return",
+                    "UniFFI stream step resource path for operation {} must belong to OutputStreamNext and start at Return",
                     operation.operation_id
                 );
             }

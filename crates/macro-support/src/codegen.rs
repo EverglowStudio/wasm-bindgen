@@ -314,7 +314,6 @@ impl ToTokens for ast::Struct {
 
 
             #[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
-            #[automatically_derived]
             const _: () = {
                 #wasm_bindgen::__wbindgen_coverage! {
                 #[no_mangle]
@@ -519,7 +518,6 @@ impl ToTokens for ast::Struct {
                     }
 
                     #[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
-                    #[automatically_derived]
                     const _: () = {
                         #[no_mangle]
                         #[doc(hidden)]
@@ -585,7 +583,6 @@ impl ToTokens for ast::StructField {
         };
 
         (quote! {
-            #[automatically_derived]
             const _: () = {
                 #wasm_bindgen::__wbindgen_coverage! {
                 #[cfg_attr(all(target_family = "wasm", not(target_os = "wasi")), no_mangle)]
@@ -628,7 +625,6 @@ impl ToTokens for ast::StructField {
 
         (quote! {
             #[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
-            #[automatically_derived]
             const _: () = {
                 #wasm_bindgen::__wbindgen_coverage! {
                 #[no_mangle]
@@ -1010,7 +1006,6 @@ impl TryToTokens for ast::Export {
         }
 
         (quote! {
-            #[automatically_derived]
             const _: () = {
                 #wasm_bindgen::__wbindgen_coverage! {
                 #(#attrs)*
@@ -1256,7 +1251,6 @@ impl TryToTokens for ast::ImportType {
                 #phantom
             }
 
-            #[automatically_derived]
             const _: () = {
                 use #wasm_bindgen::convert::TryFromJsValue;
                 use #wasm_bindgen::convert::{IntoWasmAbi, FromWasmAbi};
@@ -3208,7 +3202,6 @@ impl<T: ToTokens> ToTokens for Descriptor<'_, T> {
         let wasm_bindgen = &self.wasm_bindgen;
         (quote! {
             #[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
-            #[automatically_derived]
             const _: () = {
                 #wasm_bindgen::__wbindgen_coverage! {
                 #(#attrs)*

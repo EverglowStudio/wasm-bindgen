@@ -79,12 +79,14 @@ fn uniffi_backend_session_definition(
     table_identifier: &str,
     operation_identifiers: &[String],
     metadata: &str,
+    close_policy: crate::ClosePolicy,
     release_object_identifier: Option<&str>,
     close_output_stream_identifier: Option<&str>,
 ) -> String {
     const TEMPLATE: &str = r#"
 const $TABLE$ = Object.freeze([$OPERATIONS$]);
 const $PLAN$ = Object.freeze($METADATA$);
+const $CLOSE_POLICY$ = Object.freeze({ graceMs: $GRACE_MS$, onDeadline: 'detach' });
 const $RESOURCE_HOOKS$ = Object.freeze({ releaseObject: $RELEASE_OBJECT$, closeOutputStream: $CLOSE_OUTPUT_STREAM$ });
 function $FACTORY$(host) {
     if ($TABLE$.length !== $PLAN$.length || $TABLE$.some((operation) => typeof operation !== 'function')) {
@@ -99,6 +101,8 @@ function $FACTORY$(host) {
 
     let phase = 'open';
     let generation = 1;
+    let detached = false;
+    let hostRef = host;
     let nextLeaseId = 1;
     let nextInvocationId = 1;
     let closePromise = null;
@@ -117,6 +121,15 @@ function $FACTORY$(host) {
     const callbackKey = (typeId, callbackId) => `${typeId}:${callbackId}`;
     const closedError = () => new Error('UniFFI wasm backend session is closed');
     const isThenable = (value) => value !== null && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function';
+    const activeHost = () => {
+        if (detached || hostRef === null) throw closedError();
+        return hostRef;
+    };
+    const hostForGeneration = (callGeneration) => {
+        if (detached || hostRef === null || generation !== callGeneration) throw closedError();
+        return hostRef;
+    };
+    const ignore = (promise) => { if (isThenable(promise)) Promise.resolve(promise).catch(() => {}); };
 
     for (const operation of $PLAN$) {
         if (operation.callbackDispatch !== null) {
@@ -202,7 +215,7 @@ function $FACTORY$(host) {
         state.forbidden ||= contract.reentrancy === 'forbidden';
         if (contract.retention === 'retained') {
             if (!state.retained) {
-                host.retainCallback(typeId, callbackId);
+                activeHost().retainCallback(typeId, callbackId);
                 state.retained = true;
                 retainedCallbacks.set(key, state);
                 scope.newRetained.push(state);
@@ -218,7 +231,7 @@ function $FACTORY$(host) {
             if (!state.retained) continue;
             state.retained = false;
             retainedCallbacks.delete(callbackKey(state.typeId, state.callbackId));
-            host.releaseCallback(state.typeId, state.callbackId);
+            if (!detached && hostRef !== null) ignore(hostRef.releaseCallback(state.typeId, state.callbackId));
             if (state.scoped === 0 && state.depth === 0) callbacks.delete(callbackKey(state.typeId, state.callbackId));
         }
         scope.newRetained.length = 0;
@@ -237,7 +250,7 @@ function $FACTORY$(host) {
         if (closedInputStreams.has(streamId)) throw new TypeError('released UniFFI input stream ID');
         let state = inputStreams.get(streamId);
         if (!state) {
-            state = { streamId, released: false, cancelStarted: false };
+            state = { streamId, released: false, cancelStarted: false, cancelPromise: null };
             inputStreams.set(streamId, state);
         }
         if (!scope.includes(state)) scope.push(state);
@@ -245,23 +258,28 @@ function $FACTORY$(host) {
 
     async function finishInput(state, cancel, reason) {
         if (!state || state.released) return;
-        if (cancel && !state.cancelStarted) {
+        if (state.cancelPromise !== null) return await state.cancelPromise;
+        if (cancel) {
             state.cancelStarted = true;
-            try { await host.cancelInputStream(state.streamId, reason); }
-            finally {
-                if (!state.released) {
-                    state.released = true;
-                    inputStreams.delete(state.streamId);
-                    closedInputStreams.add(state.streamId);
-                    host.releaseInputStream(state.streamId);
+            state.cancelPromise = (async () => {
+                try {
+                    if (!detached && hostRef !== null) await hostRef.cancelInputStream(state.streamId, reason);
                 }
-            }
-            return;
+                finally {
+                    if (!state.released) {
+                        state.released = true;
+                        inputStreams.delete(state.streamId);
+                        closedInputStreams.add(state.streamId);
+                        if (!detached && hostRef !== null) ignore(hostRef.releaseInputStream(state.streamId));
+                    }
+                }
+            })();
+            return await state.cancelPromise;
         }
         state.released = true;
         inputStreams.delete(state.streamId);
         closedInputStreams.add(state.streamId);
-        host.releaseInputStream(state.streamId);
+        if (!detached && hostRef !== null) ignore(hostRef.releaseInputStream(state.streamId));
     }
 
     function beginUseSites(operation, args) {
@@ -320,6 +338,7 @@ function $FACTORY$(host) {
         state.released = true;
         releasedLeases.add(state.lease);
         objectLeases.delete(state.lease.leaseId);
+        if (detached) return;
         await invokeReleaseSlot(state);
     }
 
@@ -331,6 +350,10 @@ function $FACTORY$(host) {
 
     async function cancelOutputState(state, reason) {
         if (!state || state.released) return;
+        if (detached) {
+            detachOutputState(state);
+            return;
+        }
         if (state.cancelPromise !== null) return await state.cancelPromise;
         state.cancelStarted = true;
         state.cancelPromise = (async () => {
@@ -349,7 +372,12 @@ function $FACTORY$(host) {
 
     async function finishOutputState(state, cancelInputs = false, reason = undefined) {
         if (!state) return;
+        if (state.released && state.closePromise === null) return;
         if (state.closePromise !== null) return await state.closePromise;
+        if (detached) {
+            detachOutputState(state);
+            return;
+        }
         state.closeStarted = true;
         state.closePromise = (async () => {
             let failure;
@@ -365,6 +393,72 @@ function $FACTORY$(host) {
             if (failure !== undefined) throw failure;
         })();
         return await state.closePromise;
+    }
+
+    // Deadline detach is deliberately a small, one-way invalidation pass. It
+    // claims every lease/token before dropping host references, invokes each
+    // synchronous cleanup hook at most once on a best-effort basis, and never
+    // waits for a user promise that may be stuck forever.
+    function detachInputState(state, detachedHost) {
+        if (!state || state.released) return;
+        state.released = true;
+        inputStreams.delete(state.streamId);
+        closedInputStreams.add(state.streamId);
+        try { detachedHost?.releaseInputStream(state.streamId); } catch {}
+    }
+
+    function detachOutputState(state) {
+        if (!state || state.detached) return;
+        state.detached = true;
+        state.released = true;
+        releasedLeases.add(state.lease);
+        outputLeases.delete(state.lease.leaseId);
+        if (!state.closeStarted) {
+            state.closeStarted = true;
+            try {
+                if (typeof $RESOURCE_HOOKS$.closeOutputStream === 'function') {
+                    ignore($RESOURCE_HOOKS$.closeOutputStream(state.handle));
+                }
+            } catch {}
+        }
+        for (const input of state.inputs) detachInputState(input, hostRef);
+        if (state.closePromise === null) state.closePromise = Promise.resolve();
+    }
+
+    function detachObjectState(state) {
+        if (!state || state.released) return;
+        state.released = true;
+        releasedLeases.add(state.lease);
+        objectLeases.delete(state.lease.leaseId);
+        try {
+            if (typeof $RESOURCE_HOOKS$.releaseObject === 'function') {
+                ignore($RESOURCE_HOOKS$.releaseObject(state.handle));
+            }
+        } catch {}
+    }
+
+    function detachSession() {
+        if (detached) return;
+        detached = true;
+        phase = 'closed';
+        generation += 1;
+        const detachedHost = hostRef;
+        for (const state of Array.from(outputLeases.values())) detachOutputState(state);
+        for (const state of Array.from(objectLeases.values())) detachObjectState(state);
+        for (const state of Array.from(inputStreams.values())) detachInputState(state, detachedHost);
+        for (const state of retainedCallbacks.values()) {
+            if (!state.retained) continue;
+            state.retained = false;
+            try { detachedHost?.releaseCallback(state.typeId, state.callbackId); } catch {}
+        }
+        retainedCallbacks.clear();
+        callbacks.clear();
+        inputStreams.clear();
+        objectLeases.clear();
+        outputLeases.clear();
+        pending.clear();
+        cleanup.clear();
+        hostRef = null;
     }
 
     function validateStreamStep(raw) {
@@ -394,11 +488,11 @@ function $FACTORY$(host) {
         return invokeCallbackHostSync(operation, callbackId, methodArgs);
     }
 
-    function invokeCallbackHostSync(operation, callbackId, methodArgs) {
+    function invokeCallbackHostSync(operation, callbackId, methodArgs, callGeneration = generation) {
         const state = callbackState(operation.callbackDispatch, callbackId);
         state.depth += 1;
         try {
-            const result = host.invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, methodArgs);
+            const result = hostForGeneration(callGeneration).invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, methodArgs);
             if (isThenable(result)) throw new TypeError('sync UniFFI callback returned a thenable');
             return result;
         } catch (error) {
@@ -411,11 +505,11 @@ function $FACTORY$(host) {
         return await invokeCallbackHostAsync(operation, callbackId, methodArgs);
     }
 
-    async function invokeCallbackHostAsync(operation, callbackId, methodArgs) {
+    async function invokeCallbackHostAsync(operation, callbackId, methodArgs, callGeneration = generation) {
         const state = callbackState(operation.callbackDispatch, callbackId);
         state.depth += 1;
         try {
-            const result = host.invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, nextInvocationId++, methodArgs);
+            const result = hostForGeneration(callGeneration).invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, nextInvocationId++, methodArgs);
             if (!isThenable(result)) throw new TypeError('async UniFFI callback did not return a thenable');
             return await result;
         } catch (error) {
@@ -423,21 +517,24 @@ function $FACTORY$(host) {
         } finally { state.depth -= 1; }
     }
 
-    async function invokeInputHost(operation, args) {
+    async function invokeInputHost(operation, args, callGeneration) {
         const streamId = args[0]?.streamId ?? args[0];
-        return operation.kind === 'inputStreamCancel' ? await cancelInputHost(streamId) : await pullInputHost(streamId);
+        return operation.kind === 'inputStreamCancel'
+            ? await cancelInputHost(streamId, callGeneration)
+            : await pullInputHost(streamId, callGeneration);
     }
 
-    async function pullInputHost(streamId) {
+    async function pullInputHost(streamId, callGeneration = generation) {
+        if (detached || generation !== callGeneration) return { kind: 'done' };
         if (closedInputStreams.has(streamId)) {
             return { kind: 'done' };
         }
         let state = inputStreams.get(streamId);
         if (!state) {
-            state = { streamId, released: false, cancelStarted: false };
+            state = { streamId, released: false, cancelStarted: false, cancelPromise: null };
             inputStreams.set(streamId, state);
         }
-        const raw = host.pullInputStream(streamId);
+        const raw = hostForGeneration(callGeneration).pullInputStream(streamId);
         if (!isThenable(raw)) throw new TypeError('Host.pullInputStream() must return a Promise');
         const step = validateStreamStep(await raw);
         if (state.released || state.cancelStarted) return { kind: 'done' };
@@ -445,42 +542,54 @@ function $FACTORY$(host) {
         return step;
     }
 
-    async function cancelInputHost(streamId) {
+    async function cancelInputHost(streamId, callGeneration = generation) {
+        if (detached || generation !== callGeneration) return;
         if (closedInputStreams.has(streamId)) return;
         let state = inputStreams.get(streamId);
         if (!state) {
-            state = { streamId, released: false, cancelStarted: false };
+            state = { streamId, released: false, cancelStarted: false, cancelPromise: null };
             inputStreams.set(streamId, state);
         }
+        hostForGeneration(callGeneration);
         await finishInput(state, true);
     }
 
-    const engineHost = Object.freeze({
+    function makeEngineHost(callGeneration) {
+        return Object.freeze({
         invokeCallbackSync(callbackTypeId, callbackId, methodId, args) {
             if (!Array.isArray(args)) throw new TypeError('UniFFI callback args must be an Array');
             const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
             if (!operation || operation.asyncKind !== 'sync') throw new Error(`unknown sync UniFFI callback method ${callbackTypeId}:${methodId}`);
-            return invokeCallbackHostSync(operation, callbackId, args);
+            return invokeCallbackHostSync(operation, callbackId, args, callGeneration);
         },
         invokeCallbackAsync(callbackTypeId, callbackId, methodId, args) {
             if (!Array.isArray(args)) return Promise.reject(new TypeError('UniFFI callback args must be an Array'));
             const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
             if (!operation || operation.asyncKind !== 'async') return Promise.reject(new Error(`unknown async UniFFI callback method ${callbackTypeId}:${methodId}`));
-            return invokeCallbackHostAsync(operation, callbackId, args);
+            return invokeCallbackHostAsync(operation, callbackId, args, callGeneration);
         },
-        pullInputStream: pullInputHost,
-        cancelInputStream: cancelInputHost,
-    });
+        pullInputStream(streamId) {
+            return pullInputHost(streamId, callGeneration);
+        },
+        cancelInputStream(streamId) {
+            return cancelInputHost(streamId, callGeneration);
+        },
+        releaseInputStream(streamId) {
+            if (detached || generation !== callGeneration || hostRef === null) return;
+            ignore(hostRef.releaseInputStream(streamId));
+        },
+        });
+    }
 
-    function invokeRaw(operation, args) {
+    function invokeRaw(operation, args, callGeneration) {
         const raw = rawArguments(operation, args);
-        if (operation.hostArgument) raw.unshift(engineHost);
+        if (operation.hostArgument) raw.unshift(makeEngineHost(callGeneration));
         return $TABLE$[operation.operationId](...raw);
     }
 
     function finishSync(operation, args, scope, result, callGeneration) {
         try {
-            if (phase !== 'open' || generation !== callGeneration) throw closedError();
+            if (detached || generation !== callGeneration) throw closedError();
             if (operation.returnResource?.kind === 'object') result = makeLease('object', operation.returnResource.id, result, []);
             if (operation.returnResource?.kind === 'outputStream') result = makeLease('output', operation.returnResource.id, result, scope.inputs);
             for (const useSite of operation.callbackUseSites) {
@@ -494,7 +603,13 @@ function $FACTORY$(host) {
 
     async function finishAsync(operation, args, scope, result, callGeneration) {
         try {
+            if (detached) {
+                if (operation.kind === 'outputStreamNext' || operation.kind === 'inputStreamPull') return { kind: 'done' };
+                if (operation.kind === 'outputStreamCancel' || operation.kind === 'inputStreamCancel') return undefined;
+                throw closedError();
+            }
             if (operation.kind === 'outputStreamNext') {
+                if (phase !== 'open') throw closedError();
                 const state = unwrapLease(args[0], 'output', operation.streamSlot.useSiteId);
                 if (state.cancelStarted || state.closeStarted) return { kind: 'done' };
                 const step = validateStreamStep(result);
@@ -506,14 +621,17 @@ function $FACTORY$(host) {
                 return undefined;
             }
             if (operation.returnResource?.kind === 'object') {
-                if (phase !== 'open' || generation !== callGeneration) {
+                if (phase !== 'open' || detached || generation !== callGeneration) {
                     await invokeReleaseSlot({ typeId: operation.returnResource.id, handle: result });
                     throw closedError();
                 }
                 result = makeLease('object', operation.returnResource.id, result, []);
             }
             if (operation.returnResource?.kind === 'outputStream') {
-                if (phase !== 'open' || generation !== callGeneration) {
+                // A stream returned after close started has no consumer that
+                // could safely own its lease. Cancel/close it immediately
+                // rather than publishing a resource that close did not see.
+                if (phase !== 'open' || detached || generation !== callGeneration) {
                     const operationId = streamSlot(outputGroups.get(operation.returnResource.id), 'outputStreamCancel');
                     try { await $TABLE$[operationId](result); }
                     finally {
@@ -528,7 +646,7 @@ function $FACTORY$(host) {
                 for (const callbackId of valuesAtPath(args, result, useSite.path, 0)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
             }
             if (operation.returnResource?.kind !== 'outputStream') await Promise.allSettled(scope.inputs.map((input) => finishInput(input, false)));
-            if (phase !== 'open' || generation !== callGeneration) throw closedError();
+            if (detached || generation !== callGeneration) throw closedError();
             return result;
         } finally { releaseScopedCallbacks(scope.callbacks); }
     }
@@ -541,7 +659,7 @@ function $FACTORY$(host) {
         if (operation.callbackDispatch !== null) return invokeCallbackSync(operation, args);
         const scope = beginUseSites(operation, args);
         try {
-            const result = invokeRaw(operation, args);
+            const result = invokeRaw(operation, args, generation);
             if (isThenable(result)) throw new TypeError(`sync UniFFI operation ${operationId} returned a thenable`);
             return finishSync(operation, args, scope, result, generation);
         } catch (error) {
@@ -563,9 +681,9 @@ function $FACTORY$(host) {
             try {
                 let result;
                 if (operation.callbackDispatch !== null) result = await invokeCallbackAsync(operation, args);
-                else if (operation.kind === 'inputStreamPull' || operation.kind === 'inputStreamCancel') result = await invokeInputHost(operation, args);
+                else if (operation.kind === 'inputStreamPull' || operation.kind === 'inputStreamCancel') result = await invokeInputHost(operation, args, callGeneration);
                 else {
-                    const raw = invokeRaw(operation, args);
+                    const raw = invokeRaw(operation, args, callGeneration);
                     if (!isThenable(raw)) throw new TypeError(`async UniFFI operation ${operationId} did not return a thenable`);
                     result = await raw;
                 }
@@ -577,6 +695,7 @@ function $FACTORY$(host) {
                     try { await cancelOutputState(unwrapLease(args[0], 'output', operation.streamSlot.useSiteId), error); } catch {}
                 }
                 await Promise.allSettled(scope.inputs.map((input) => finishInput(input, true, error)));
+                if (detached) return undefined;
                 throw error;
             }
         })();
@@ -598,30 +717,51 @@ function $FACTORY$(host) {
     function close() {
         if (closePromise !== null) return closePromise;
         phase = 'closing';
-        generation += 1;
-        closePromise = (async () => {
+        let deadlineTimer;
+        const deadline = new Promise((resolve) => {
+            deadlineTimer = setTimeout(() => resolve('deadline'), $CLOSE_POLICY$.graceMs);
+        });
+        const drain = (async () => {
+            // Start every native/host cleanup in this turn.  A single shared
+            // deadline then covers all in-flight calls and resource hooks.
             for (const state of Array.from(outputLeases.values())) track(cleanup, cancelOutputState(state));
             for (const state of Array.from(objectLeases.values())) track(cleanup, releaseObjectState(state));
             for (const state of Array.from(inputStreams.values())) track(cleanup, finishInput(state, true));
-            while (pending.size !== 0) await Promise.allSettled([...pending]);
+            while (pending.size !== 0 || cleanup.size !== 0) {
+                await Promise.allSettled([...pending, ...cleanup]);
+            }
+            return 'natural';
+        })();
+        closePromise = (async () => {
+            const result = await Promise.race([drain, deadline]);
+            clearTimeout(deadlineTimer);
+            if (result === 'deadline' && (pending.size !== 0 || cleanup.size !== 0)) {
+                detachSession();
+                return;
+            }
+            // A natural close has drained all work in the original
+            // generation.  Release retained callbacks exactly once before
+            // revoking the host and incrementing the generation.
             for (const state of retainedCallbacks.values()) {
                 if (state.retained) {
                     state.retained = false;
-                    host.releaseCallback(state.typeId, state.callbackId);
+                    try { hostRef?.releaseCallback(state.typeId, state.callbackId); } catch {}
                 }
             }
             retainedCallbacks.clear();
-            while (cleanup.size !== 0) await Promise.allSettled([...cleanup]);
             callbacks.clear();
             objectLeases.clear();
             outputLeases.clear();
+            inputStreams.clear();
+            generation += 1;
             phase = 'closed';
+            hostRef = null;
         })();
         return closePromise;
     }
 
     return Object.freeze({
-        info: Object.freeze({ engine: 'wasm-bindgen', surfaceId: 'base', operationCount: $PLAN$.length }),
+        info: Object.freeze({ engine: 'wasm-bindgen', surfaceId: 'base', operationCount: $PLAN$.length, closePolicy: $CLOSE_POLICY$ }),
         invokeSync,
         invokeAsync,
         releaseObject,
@@ -637,6 +777,11 @@ function $FACTORY$(host) {
         .replace("$OPERATIONS$", &operation_identifiers.join(", "))
         .replace("$PLAN$", &plan_identifier)
         .replace("$METADATA$", metadata)
+        .replace(
+            "$CLOSE_POLICY$",
+            &format!("{factory_identifier}_close_policy"),
+        )
+        .replace("$GRACE_MS$", &close_policy.grace_ms().to_string())
         .replace(
             "$RELEASE_OBJECT$",
             release_object_identifier.unwrap_or("null"),
@@ -3420,6 +3565,7 @@ if (require('worker_threads').isMainThread) {{
             &table_identifier,
             &operation_identifiers,
             &metadata,
+            config.close_policy(),
             release_object_identifier.as_deref(),
             close_output_stream_identifier.as_deref(),
         );
@@ -8312,8 +8458,9 @@ fn write_es_import(dest: &mut String, module: &str, items: &[(String, Option<Str
 mod uniffi_surface_tests {
     use super::*;
     use crate::{
-        BindingSurface, UniFfiBackendAsyncKind, UniFfiBackendCarrier, UniFfiBackendConfig,
-        UniFfiBackendOperation, UniFfiBackendOperationKind, UniFfiBackendResourceExports,
+        BindingSurface, ClosePolicy, DeadlineAction, UniFfiBackendAsyncKind, UniFfiBackendCarrier,
+        UniFfiBackendConfig, UniFfiBackendOperation, UniFfiBackendOperationKind,
+        UniFfiBackendResourceExports,
     };
 
     #[test]
@@ -8335,6 +8482,10 @@ mod uniffi_surface_tests {
                     )
                     .unwrap()],
                     UniFfiBackendResourceExports::default(),
+                    ClosePolicy {
+                        grace_ms: 5_000,
+                        on_deadline: DeadlineAction::Detach,
+                    },
                 )
                 .unwrap(),
             ));

@@ -29,6 +29,12 @@ use wasm_bindgen_cli_support::{
 };
 use wasm_bindgen_macro_support::{ExpansionBuilder, ExpansionContext};
 
+/// Engine-owned projection of the canonical UniFFI teardown policy.  The
+/// definition lives in cli-support because the generated JS session consumes
+/// it directly; re-exporting it here keeps callers on the single in-memory
+/// engine boundary and does not introduce a serialized schema.
+pub use wasm_bindgen_cli_support::{ClosePolicy, DeadlineAction};
+
 pub const DEFAULT_BACKEND_FACTORY: &str = "__uniffi_backend_factory";
 const RELEASE_OBJECT_EXPORT: &str = "__uniffi_release_object";
 const CLOSE_OUTPUT_STREAM_EXPORT: &str = "__uniffi_close_output_stream";
@@ -580,30 +586,43 @@ pub struct WasmEnginePlan {
     factory_export_name: String,
     operations: Vec<ValidatedOperation>,
     resource_hooks: WasmEngineResourceHooks,
+    close_policy: ClosePolicy,
 }
 
 impl WasmEnginePlan {
-    pub fn build(operations: Vec<WasmOperationPlan>) -> Result<Self, EngineError> {
+    pub fn build(
+        close_policy: ClosePolicy,
+        operations: Vec<WasmOperationPlan>,
+    ) -> Result<Self, EngineError> {
         Self::with_factory_and_resource_hooks(
             DEFAULT_BACKEND_FACTORY,
+            close_policy,
             operations,
             WasmEngineResourceHooks::default(),
         )
     }
 
     pub fn build_with_resource_hooks(
+        close_policy: ClosePolicy,
         operations: Vec<WasmOperationPlan>,
         resource_hooks: WasmEngineResourceHooks,
     ) -> Result<Self, EngineError> {
-        Self::with_factory_and_resource_hooks(DEFAULT_BACKEND_FACTORY, operations, resource_hooks)
+        Self::with_factory_and_resource_hooks(
+            DEFAULT_BACKEND_FACTORY,
+            close_policy,
+            operations,
+            resource_hooks,
+        )
     }
 
     pub fn with_factory(
         factory_export_name: impl Into<String>,
+        close_policy: ClosePolicy,
         operations: Vec<WasmOperationPlan>,
     ) -> Result<Self, EngineError> {
         Self::with_factory_and_resource_hooks(
             factory_export_name,
+            close_policy,
             operations,
             WasmEngineResourceHooks::default(),
         )
@@ -611,9 +630,13 @@ impl WasmEnginePlan {
 
     pub fn with_factory_and_resource_hooks(
         factory_export_name: impl Into<String>,
+        close_policy: ClosePolicy,
         operations: Vec<WasmOperationPlan>,
         resource_hooks: WasmEngineResourceHooks,
     ) -> Result<Self, EngineError> {
+        close_policy
+            .validate()
+            .map_err(|error| EngineError::InvalidPlan(error.to_string()))?;
         let factory_export_name = factory_export_name.into();
         let mut supplied = BTreeMap::new();
         for operation in operations {
@@ -643,11 +666,17 @@ impl WasmEnginePlan {
 
         // Reuse cli-support's identifier/dense-table validation for the one
         // backend factory, without exposing its config or Bindgen type.
-        backend_config(&factory_export_name, &validated, &resource_hooks)?;
+        backend_config(
+            &factory_export_name,
+            close_policy,
+            &validated,
+            &resource_hooks,
+        )?;
         Ok(Self {
             factory_export_name,
             operations: validated,
             resource_hooks,
+            close_policy,
         })
     }
 
@@ -667,6 +696,7 @@ impl WasmEnginePlan {
             target,
             backend: backend_config(
                 &self.factory_export_name,
+                self.close_policy,
                 &self.operations,
                 &self.resource_hooks,
             )
@@ -708,6 +738,10 @@ impl WasmEnginePlan {
 
     pub fn operation_count(&self) -> usize {
         self.operations.len()
+    }
+
+    pub fn close_policy(&self) -> ClosePolicy {
+        self.close_policy
     }
 
     pub fn operation_plans(&self) -> impl Iterator<Item = &WasmOperationPlan> {
@@ -995,6 +1029,7 @@ fn validate_value_path(
 
 fn backend_config(
     factory_export_name: &str,
+    close_policy: ClosePolicy,
     operations: &[ValidatedOperation],
     resource_hooks: &WasmEngineResourceHooks,
 ) -> Result<UniFfiBackendConfig, EngineError> {
@@ -1085,8 +1120,13 @@ fn backend_config(
             .map(|_| CLOSE_OUTPUT_STREAM_EXPORT.to_owned()),
     )
     .map_err(|error| EngineError::Surface(error.to_string()))?;
-    UniFfiBackendConfig::new(factory_export_name, operations, resource_exports)
-        .map_err(|error| EngineError::Surface(error.to_string()))
+    UniFfiBackendConfig::new(
+        factory_export_name,
+        operations,
+        resource_exports,
+        close_policy,
+    )
+    .map_err(|error| EngineError::Surface(error.to_string()))
 }
 
 fn operation_requires_host(operation: &WasmOperationPlan) -> bool {
@@ -1505,6 +1545,13 @@ impl Error for EngineError {}
 mod tests {
     use super::*;
 
+    fn policy() -> ClosePolicy {
+        ClosePolicy {
+            grace_ms: 5_000,
+            on_deadline: DeadlineAction::Detach,
+        }
+    }
+
     fn operation(id: u32) -> WasmOperationPlan {
         WasmOperationPlan {
             operation_id: id,
@@ -1551,7 +1598,7 @@ mod tests {
 
     #[test]
     fn engine_plan_owns_dense_operation_validation() {
-        let plan = WasmEnginePlan::build(vec![operation(1)]).unwrap_err();
+        let plan = WasmEnginePlan::build(policy(), vec![operation(1)]).unwrap_err();
         assert_eq!(
             plan,
             EngineError::NonDenseOperation {
@@ -1560,13 +1607,14 @@ mod tests {
             }
         );
 
-        let duplicate = WasmEnginePlan::build(vec![operation(0), operation(0)]).unwrap_err();
+        let duplicate =
+            WasmEnginePlan::build(policy(), vec![operation(0), operation(0)]).unwrap_err();
         assert_eq!(duplicate, EngineError::DuplicateOperation(0));
     }
 
     #[test]
     fn structured_plan_expands_real_wasm_descriptors() {
-        let plan = WasmEnginePlan::build(vec![operation(0)]).unwrap();
+        let plan = WasmEnginePlan::build(policy(), vec![operation(0)]).unwrap();
         let context = ExpansionContext::new(
             std::env::current_dir().unwrap(),
             "fixture",
@@ -1615,7 +1663,7 @@ mod tests {
                 },
             });
         assert!(matches!(
-            WasmEnginePlan::build(vec![invalid_callback]),
+            WasmEnginePlan::build(policy(), vec![invalid_callback]),
             Err(EngineError::InvalidPlan(message)) if message.contains("callback use-site")
         ));
 
@@ -1654,7 +1702,7 @@ mod tests {
                 slot_operation_ids: BTreeMap::from([(WasmOperationKind::OutputStreamStart, 0)]),
             });
         assert!(matches!(
-            WasmEnginePlan::build(vec![incomplete_stream]),
+            WasmEnginePlan::build(policy(), vec![incomplete_stream]),
             Err(EngineError::InvalidPlan(message)) if message.contains("complete canonical slot")
         ));
     }
@@ -1667,7 +1715,7 @@ mod tests {
         result.abi_carrier = WasmCarrier::OpaqueHandle;
         result.conversion = WasmConversionRecipe::Object(9);
         assert!(matches!(
-            WasmEnginePlan::build(vec![object]),
+            WasmEnginePlan::build(policy(), vec![object]),
             Err(EngineError::Surface(message)) if message.contains("explicit object release export")
         ));
     }

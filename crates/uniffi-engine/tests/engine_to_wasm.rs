@@ -736,18 +736,24 @@ fn engine_plan() -> WasmEnginePlan {
     operations.push(output_only_cancel);
 
     WasmEnginePlan::build_with_resource_hooks(
+        wasm_bindgen_uniffi_engine::ClosePolicy {
+            // Real conformance uses a short policy so a deliberately stuck
+            // callback/stream/cleanup fixture cannot hold the test process.
+            grace_ms: 25,
+            on_deadline: wasm_bindgen_uniffi_engine::DeadlineAction::Detach,
+        },
         operations,
         WasmEngineResourceHooks {
             release_object: Some(WasmEngineResourceHook {
                 rust_call: RustPath::new(["fixture".to_owned(), "release_object".to_owned()])
                     .unwrap(),
-                async_kind: WasmAsyncKind::Sync,
+                async_kind: WasmAsyncKind::Async,
                 fallible: false,
             }),
             close_output_stream: Some(WasmEngineResourceHook {
                 rust_call: RustPath::new(["fixture".to_owned(), "close_output_stream".to_owned()])
                     .unwrap(),
-                async_kind: WasmAsyncKind::Sync,
+                async_kind: WasmAsyncKind::Async,
                 fallible: false,
             }),
         },
@@ -846,6 +852,17 @@ mod fixture {{
         JsFuture::from(promise).await.unwrap();
     }}
 
+    async fn wait_for_test_gate() {{
+        let gate: Promise = Reflect::get(
+            &js_sys::global(),
+            &JsValue::from_str("__uniffi_test_gate"),
+        )
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+        JsFuture::from(gate).await.unwrap();
+    }}
+
     async fn pull_host_input(host: &JsValue, input: u32) -> JsValue {{
         let promise: Promise = host_method(host, "pullInputStream")
             .call1(host, &JsValue::from_f64(input as f64))
@@ -902,6 +919,9 @@ mod fixture {{
     pub async fn l_input_cancel_unused(_handle: u32) {{}}
 
     pub async fn m_output_next(handle: u32) -> JsValue {{
+        if handle == 1091 {{
+            std::future::pending::<JsValue>().await;
+        }}
         if handle == 1064 {{
             return step("error", Some("error"), Some(JsValue::from_str("stream failure")));
         }}
@@ -921,7 +941,10 @@ mod fixture {{
         }}
     }}
 
-    pub async fn n_output_cancel(_handle: u32) {{
+    pub async fn n_output_cancel(handle: u32) {{
+        if handle == 1091 || handle == 1092 {{
+            std::future::pending::<()>().await;
+        }}
         STATE.with(|state| state.borrow_mut().cancel += 1);
     }}
 
@@ -937,6 +960,9 @@ mod fixture {{
         Err(JsValue::from_str(&format!("reject callback {{callback_id}}")))
     }}
     pub async fn s_register_callback_async(host: JsValue, callback_id: u32) -> u32 {{
+        if callback_id == 44 {{
+            wait_for_test_gate().await;
+        }}
         invoke_host_async(&host, callback_id, "from-rust-async").await;
         callback_id
     }}
@@ -945,6 +971,9 @@ mod fixture {{
         callback_id
     }}
     pub async fn u_consume_input(host: JsValue, input: u32) -> u32 {{
+        if input == 94 {{
+            wait_for_test_gate().await;
+        }}
         pull_host_input(&host, input).await;
         pull_host_input(&host, input).await;
         input
@@ -958,11 +987,17 @@ mod fixture {{
     pub async fn y_output_next(handle: u32) -> JsValue {{ m_output_next(handle).await }}
     pub async fn z_output_cancel(handle: u32) {{ n_output_cancel(handle).await }}
 
-    pub fn release_object(_handle: u32) {{
+    pub async fn release_object(handle: u32) {{
+        if handle == 703 {{
+            std::future::pending::<()>().await;
+        }}
         STATE.with(|state| state.borrow_mut().release += 1);
     }}
 
-    pub fn close_output_stream(_handle: u32) {{
+    pub async fn close_output_stream(handle: u32) {{
+        if handle == 1093 {{
+            std::future::pending::<()>().await;
+        }}
         STATE.with(|state| state.borrow_mut().close += 1);
     }}
 }}
@@ -1070,12 +1105,14 @@ const inputPulls = new Map();
 const inputCancelled = [];
 const inputReleased = [];
 let session;
+let reentrantSession;
 const host = {{
     invokeCallbackSync(typeId, callbackId, methodId, args) {{
         assert.equal(typeId, 7);
-        assert.ok(callbackId === 41 || callbackId === 42 || callbackId === 43);
+        assert.ok(callbackId === 41 || callbackId === 42 || callbackId === 43 || callbackId === 44);
         callbackInvocations.push(['sync', methodId, ...args]);
         if (methodId === 0 && args[0] === 'reenter') return session.invokeSync(5, [callbackId, 'nested']);
+        if (methodId === 0 && args[0] === 'close') {{ reentrantSession.close(); return 'sync-0:close'; }}
         if (methodId === 0 && args[0] === 'thenable') return Promise.resolve('invalid');
         if (methodId === 0 && args[0] === 'throw-infallible') throw new Error('host failure');
         if (methodId === 1 && args[0] === 'reject') throw new Error('sync callback declared error');
@@ -1083,9 +1120,10 @@ const host = {{
     }},
     async invokeCallbackAsync(typeId, callbackId, methodId, invocationId, args) {{
         assert.equal(typeId, 7);
-        assert.ok(callbackId === 41 || callbackId === 42 || callbackId === 43);
+        assert.ok(callbackId === 41 || callbackId === 42 || callbackId === 43 || callbackId === 44);
         callbackInvocations.push(['async', methodId, invocationId, ...args]);
         if (methodId === 2 && args[0] === 'deferred') await new Promise((resolve) => setTimeout(resolve, 5));
+        if (methodId === 2 && args[0] === 'never') return new Promise(() => {{}});
         if (methodId === 2 && args[0] === 'throw-infallible') throw new Error('async host failure');
         if (methodId === 3 && args[0] === 'reject') throw new Error('async callback declared error');
         return `async-${{methodId}}:${{args[0]}}`;
@@ -1095,10 +1133,15 @@ const host = {{
     async pullInputStream(streamId) {{
         const count = (inputPulls.get(streamId) ?? 0) + 1;
         inputPulls.set(streamId, count);
+        if (streamId === 91) return new Promise(() => {{}});
         if (streamId === 57) return {{ kind: 'error', error: 'input failure' }};
         return count === 1 ? {{ kind: 'item', value: streamId }} : {{ kind: 'done' }};
     }},
-    async cancelInputStream(streamId) {{ inputCancelled.push(streamId); }},
+    async cancelInputStream(streamId) {{
+        inputCancelled.push(streamId);
+        if (streamId === 92) return new Promise(() => {{}});
+        if (streamId === 94) await new Promise((resolve) => setTimeout(resolve, 8));
+    }},
     releaseInputStream(streamId) {{ inputReleased.push(streamId); }},
 }};
 
@@ -1180,7 +1223,7 @@ const lateObject = session.invokeAsync(16, [702]);
 const closePromise = session.close();
 assert.equal(session.close(), closePromise);
 await assert.rejects(lateObject, /closed/);
-await assert.rejects(pendingCallback, /closed/);
+assert.equal(await pendingCallback, 'async-2:deferred');
 await assert.rejects(pendingNext, /stale|closed|released/);
 await closePromise;
 assert.throws(() => session.invokeSync(15, []), /closed/);
@@ -1194,6 +1237,82 @@ assert.equal(inspector.invokeSync(4, [41]), 41);
 assert.equal(await inspector.invokeAsync(7, [41, 'next-session']), 'async-2:next-session');
 assert.equal(callbackInvocations.at(-1)[2], 1);
 await inspector.close();
+
+// Reentrant close from a synchronous callback keeps the in-flight invocation
+// on its original generation; only the next call is rejected.
+reentrantSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+assert.equal(reentrantSession.invokeSync(4, [41]), 41);
+assert.equal(reentrantSession.invokeSync(5, [41, 'close']), 'sync-0:close');
+await reentrantSession.close();
+
+// A raw async operation may suspend before it first calls Host.  Its captured
+// generation-scoped proxy remains usable during closing, so the operation can
+// call callback and input hooks after close starts but before the deadline.
+let releaseGate;
+globalThis.__uniffi_test_gate = new Promise((resolve) => {{ releaseGate = resolve; }});
+const delayedSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+assert.equal(delayedSession.invokeSync(4, [44]), 44);
+const delayedCallback = delayedSession.invokeAsync(18, [44]);
+const delayedInput = delayedSession.invokeAsync(20, [94]);
+const delayedClose = delayedSession.close();
+setTimeout(() => releaseGate(), 5);
+assert.equal(await delayedCallback, 44);
+assert.equal(await delayedInput, 94);
+await delayedClose;
+delete globalThis.__uniffi_test_gate;
+
+// Natural close must clear its deadline timer rather than merely completing
+// after the deadline.  Intercept the host timers for one fresh session so the
+// behavior is directly observable without relying on wall-clock timing.
+const savedSetTimeout = globalThis.setTimeout;
+const savedClearTimeout = globalThis.clearTimeout;
+let createdTimers = 0;
+let clearedTimers = 0;
+globalThis.setTimeout = (callback, delay) => {{
+    createdTimers += 1;
+    return savedSetTimeout(callback, delay);
+}};
+globalThis.clearTimeout = (timer) => {{
+    clearedTimers += 1;
+    return savedClearTimeout(timer);
+}};
+const naturalSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+await naturalSession.close();
+globalThis.setTimeout = savedSetTimeout;
+globalThis.clearTimeout = savedClearTimeout;
+assert.equal(createdTimers, 1);
+assert.equal(clearedTimers, 1);
+
+// A short-policy session must detach when callback, input, output, and
+// backend cleanup promises never settle.  The late callback promise is kept
+// intentionally unresolved; close must still resolve and no later callback or
+// release may enter the Host.
+const deadlineSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+assert.equal(deadlineSession.invokeSync(4, [41]), 41);
+const stuckCallback = deadlineSession.invokeAsync(7, [41, 'never']);
+const stuckInput = deadlineSession.invokeAsync(20, [91]);
+const stuckOutputNext = deadlineSession.invokeSync(9, [91]);
+const stuckNext = deadlineSession.invokeAsync(12, [stuckOutputNext]);
+const stuckCancelOutput = deadlineSession.invokeSync(9, [92]);
+const stuckCancel = deadlineSession.cancelOutputStream(stuckCancelOutput);
+const stuckCleanupOutput = deadlineSession.invokeSync(9, [93]);
+deadlineSession.releaseOutputStream(stuckCleanupOutput);
+const stuckObject = deadlineSession.invokeAsync(16, [703]);
+const deadlineStart = Date.now();
+const deadlinePromise = deadlineSession.close();
+assert.equal(deadlineSession.close(), deadlinePromise);
+await deadlinePromise;
+assert.ok(Date.now() - deadlineStart < 500);
+assert.throws(() => deadlineSession.invokeSync(15, []), /closed/);
+const remainsPending = async (promise) => Promise.race([
+    promise.then(() => false, () => false),
+    new Promise((resolve) => setTimeout(() => resolve(true), 60)),
+]);
+assert.equal(await remainsPending(stuckCallback), true);
+assert.equal(await remainsPending(stuckInput), true);
+assert.equal(await remainsPending(stuckNext), true);
+assert.equal(await remainsPending(stuckCancel), true);
+assert.equal(await remainsPending(stuckObject), true);
 void closeOutput;
 "#
     )

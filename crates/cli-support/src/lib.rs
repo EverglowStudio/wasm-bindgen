@@ -311,6 +311,46 @@ pub struct UniFfiBackendResourceExports {
     close_output_stream_export_name: Option<String>,
 }
 
+/// The engine-owned teardown policy projected from UniFFI's canonical bridge
+/// plan.  This type is deliberately tiny and in-memory: it has no parser,
+/// default, version, identity, or persisted representation.  Callers must
+/// supply the canonical values when constructing a backend surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeadlineAction {
+    /// Invalidate the current generation and detach late JavaScript results.
+    Detach,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClosePolicy {
+    pub grace_ms: u32,
+    pub on_deadline: DeadlineAction,
+}
+
+impl ClosePolicy {
+    /// Validate the small subset of policy values that can safely be
+    /// represented by JavaScript's Number without rounding.
+    pub fn validate(&self) -> Result<(), Error> {
+        // `u32` is already below Number.MAX_SAFE_INTEGER.  Keep the explicit
+        // bound here so changing the carrier later cannot silently weaken the
+        // JavaScript contract.
+        if u64::from(self.grace_ms) > 9_007_199_254_740_991 {
+            bail!("UniFFI close policy grace_ms is not exactly representable in JavaScript");
+        }
+        match self.on_deadline {
+            DeadlineAction::Detach => Ok(()),
+        }
+    }
+
+    pub fn grace_ms(&self) -> u32 {
+        self.grace_ms
+    }
+
+    pub fn on_deadline(&self) -> DeadlineAction {
+        self.on_deadline
+    }
+}
+
 impl UniFfiBackendResourceExports {
     pub fn new(
         release_object_export_name: Option<String>,
@@ -358,6 +398,7 @@ pub struct UniFfiBackendConfig {
     factory_export_name: String,
     operations: Vec<UniFfiBackendOperation>,
     resource_exports: UniFfiBackendResourceExports,
+    close_policy: ClosePolicy,
 }
 
 impl UniFfiBackendConfig {
@@ -365,7 +406,9 @@ impl UniFfiBackendConfig {
         factory_export_name: impl Into<String>,
         mut operations: Vec<UniFfiBackendOperation>,
         resource_exports: UniFfiBackendResourceExports,
+        close_policy: ClosePolicy,
     ) -> Result<Self, Error> {
+        close_policy.validate()?;
         let factory_export_name = factory_export_name.into();
         if !is_valid_ident(&factory_export_name) {
             bail!("UniFFI backend factory `{factory_export_name}` is not a JavaScript identifier");
@@ -424,6 +467,7 @@ impl UniFfiBackendConfig {
             factory_export_name,
             operations,
             resource_exports,
+            close_policy,
         })
     }
 
@@ -437,6 +481,10 @@ impl UniFfiBackendConfig {
 
     pub fn resource_exports(&self) -> &UniFfiBackendResourceExports {
         &self.resource_exports
+    }
+
+    pub fn close_policy(&self) -> ClosePolicy {
+        self.close_policy
     }
 
     pub(crate) fn operation_metadata_json(&self) -> Result<String, Error> {
@@ -1593,6 +1641,10 @@ mod uniffi_surface_api_tests {
                 "__uniffi_backend_factory",
                 vec![operation(0, "__uniffi_op_0")],
                 UniFfiBackendResourceExports::default(),
+                ClosePolicy {
+                    grace_ms: 5_000,
+                    on_deadline: DeadlineAction::Detach,
+                },
             )
             .unwrap(),
         )
@@ -1629,6 +1681,10 @@ mod uniffi_surface_api_tests {
             "__uniffi_backend_factory",
             vec![operation(1, "__uniffi_op_1")],
             UniFfiBackendResourceExports::default(),
+            ClosePolicy {
+                grace_ms: 5_000,
+                on_deadline: DeadlineAction::Detach,
+            },
         );
         assert!(sparse.is_err());
 
@@ -1636,6 +1692,10 @@ mod uniffi_surface_api_tests {
             "__uniffi_backend_factory",
             vec![operation(0, "__uniffi_op"), operation(1, "__uniffi_op")],
             UniFfiBackendResourceExports::default(),
+            ClosePolicy {
+                grace_ms: 5_000,
+                on_deadline: DeadlineAction::Detach,
+            },
         );
         assert!(duplicate.is_err());
     }

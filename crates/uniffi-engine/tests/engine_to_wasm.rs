@@ -312,13 +312,18 @@ fn engine_plan() -> WasmEnginePlan {
             WasmCarrier::U32,
         )],
         Some(WasmReturnBinding {
-            rust_type: WasmRustType::Stream(Box::new(WasmRustType::Scalar(WasmScalarType::U32))),
+            rust_type: WasmRustType::Stream {
+                item: Box::new(WasmRustType::Scalar(WasmScalarType::U32)),
+                error: Box::new(WasmRustType::Scalar(WasmScalarType::String)),
+                is_send: true,
+            },
             carrier: WasmRustCarrier::OutputStream,
             abi_carrier: WasmCarrier::OpaqueHandle,
             ownership: WasmOwnership::Owned,
-            conversion: WasmConversionRecipe::OutputStream(Box::new(
-                WasmConversionRecipe::Identity,
-            )),
+            conversion: WasmConversionRecipe::OutputStream {
+                item: Box::new(WasmConversionRecipe::Identity),
+                error: Box::new(WasmConversionRecipe::Identity),
+            },
         }),
         WasmAsyncKind::Sync,
         None,
@@ -714,13 +719,18 @@ fn engine_plan() -> WasmEnginePlan {
         "x_start_output",
         Vec::new(),
         Some(WasmReturnBinding {
-            rust_type: WasmRustType::Stream(Box::new(WasmRustType::Scalar(WasmScalarType::U32))),
+            rust_type: WasmRustType::Stream {
+                item: Box::new(WasmRustType::Scalar(WasmScalarType::U32)),
+                error: Box::new(WasmRustType::Scalar(WasmScalarType::String)),
+                is_send: true,
+            },
             carrier: WasmRustCarrier::OutputStream,
             abi_carrier: WasmCarrier::OpaqueHandle,
             ownership: WasmOwnership::Owned,
-            conversion: WasmConversionRecipe::OutputStream(Box::new(
-                WasmConversionRecipe::Identity,
-            )),
+            conversion: WasmConversionRecipe::OutputStream {
+                item: Box::new(WasmConversionRecipe::Identity),
+                error: Box::new(WasmConversionRecipe::Identity),
+            },
         }),
         WasmAsyncKind::Sync,
         None,

@@ -304,9 +304,20 @@ pub enum WasmRustType {
     Sequence(Box<Self>),
     Map(Box<Self>, Box<Self>),
     Set(Box<Self>),
-    Stream(Box<Self>),
-    InputStream(Box<Self>),
-    StreamStep { item: Box<Self>, error: Box<Self> },
+    Stream {
+        item: Box<Self>,
+        error: Box<Self>,
+        is_send: bool,
+    },
+    InputStream {
+        item: Box<Self>,
+        error: Box<Self>,
+        is_send: bool,
+    },
+    StreamStep {
+        item: Box<Self>,
+        error: Box<Self>,
+    },
     Custom(Box<Self>),
 }
 
@@ -327,8 +338,8 @@ pub enum WasmConversionRecipe {
     Object(u32),
     Custom(u32, Box<Self>),
     Callback(u32),
-    InputStream(Box<Self>),
-    OutputStream(Box<Self>),
+    InputStream { item: Box<Self>, error: Box<Self> },
+    OutputStream { item: Box<Self>, error: Box<Self> },
     StreamStep { item: Box<Self>, error: Box<Self> },
 }
 
@@ -1237,9 +1248,12 @@ fn conversion_object_ids(conversion: &WasmConversionRecipe) -> BTreeSet<u32> {
             WasmConversionRecipe::Optional(inner)
             | WasmConversionRecipe::Sequence(inner)
             | WasmConversionRecipe::Set(inner)
-            | WasmConversionRecipe::InputStream(inner)
-            | WasmConversionRecipe::OutputStream(inner)
             | WasmConversionRecipe::Custom(_, inner) => visit(inner, ids),
+            WasmConversionRecipe::InputStream { item, error }
+            | WasmConversionRecipe::OutputStream { item, error } => {
+                visit(item, ids);
+                visit(error, ids);
+            }
             WasmConversionRecipe::Map(key, value)
             | WasmConversionRecipe::StreamStep {
                 item: key,
@@ -1783,6 +1797,41 @@ impl Error for EngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_binding_preserves_item_error_and_sendability() {
+        let binding = WasmValueBinding {
+            rust_type: WasmRustType::InputStream {
+                item: Box::new(WasmRustType::Scalar(WasmScalarType::U32)),
+                error: Box::new(WasmRustType::Scalar(WasmScalarType::String)),
+                is_send: false,
+            },
+            carrier: WasmRustCarrier::InputStream,
+            abi_carrier: WasmCarrier::OpaqueHandle,
+            conversion: WasmConversionRecipe::InputStream {
+                item: Box::new(WasmConversionRecipe::Identity),
+                error: Box::new(WasmConversionRecipe::Identity),
+            },
+        };
+        let WasmRustType::InputStream {
+            item,
+            error,
+            is_send,
+        } = &binding.rust_type
+        else {
+            panic!("expected input stream binding");
+        };
+        assert!(matches!(**item, WasmRustType::Scalar(WasmScalarType::U32)));
+        assert!(matches!(
+            **error,
+            WasmRustType::Scalar(WasmScalarType::String)
+        ));
+        assert!(!*is_send);
+        assert!(matches!(
+            &binding.conversion,
+            WasmConversionRecipe::InputStream { .. }
+        ));
+    }
 
     fn policy() -> ClosePolicy {
         ClosePolicy {

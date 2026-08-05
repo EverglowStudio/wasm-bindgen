@@ -590,7 +590,6 @@ pub struct WasmOperationPlan {
     pub owner: WasmOperationOwner,
     pub kind: WasmOperationKind,
     pub callback_method_id: Option<u32>,
-    pub private_ffi_symbol: Option<String>,
     pub call_target: WasmCallTarget,
     /// The generated local adapter selected by the UniFFI frontend.  The
     /// call target above remains the lossless core identity; this path is the
@@ -1757,7 +1756,6 @@ mod tests {
             owner: WasmOperationOwner::Namespace,
             kind: WasmOperationKind::Function,
             callback_method_id: None,
-            private_ffi_symbol: None,
             call_target: WasmCallTarget::FreeFunction {
                 module: RustPath::new(["fixture".to_owned()]).unwrap(),
                 item: "increment".to_owned(),

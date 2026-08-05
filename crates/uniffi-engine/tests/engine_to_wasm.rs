@@ -113,7 +113,6 @@ fn engine_plan() -> WasmEnginePlan {
             owner: WasmOperationOwner::Namespace,
             kind: WasmOperationKind::Function,
             callback_method_id: None,
-            private_ffi_symbol: None,
             call_target: WasmCallTarget::FreeFunction {
                 module: RustPath::new(["fixture".to_owned()]).unwrap(),
                 item: name.to_owned(),

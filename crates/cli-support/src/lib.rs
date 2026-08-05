@@ -738,10 +738,38 @@ fn validate_uniffi_backend_operation(
             );
         }
         validate_uniffi_value_path(operation, &stream.path, "stream")?;
+        let has_output_start = stream
+            .slots
+            .iter()
+            .any(|slot| slot.kind == UniFfiBackendOperationKind::OutputStreamStart);
+        // Output streams nested below a record/container are created while
+        // the parent operation returns its value.  They therefore have no
+        // independent start operation and expose only next/cancel slots.
+        // Direct output streams retain the three-slot start/next/cancel
+        // contract.  The direction in the canonical group is authoritative;
+        // it must not be inferred from an incidental slot.
+        let nested_output = stream.direction == UniFfiBackendStreamDirection::Output
+            && !has_output_start
+            && stream.path.segments().len() > 1;
+        if (stream.direction == UniFfiBackendStreamDirection::Input && has_output_start)
+            || (stream.direction == UniFfiBackendStreamDirection::Output
+                && !has_output_start
+                && !nested_output)
+        {
+            bail!(
+                "UniFFI stream use-site {} has an invalid canonical direction/slot combination",
+                stream.use_site_id
+            );
+        }
         let expected = match stream.direction {
             UniFfiBackendStreamDirection::Input => [
                 UniFfiBackendOperationKind::InputStreamPull,
                 UniFfiBackendOperationKind::InputStreamCancel,
+            ]
+            .as_slice(),
+            UniFfiBackendStreamDirection::Output if nested_output => [
+                UniFfiBackendOperationKind::OutputStreamNext,
+                UniFfiBackendOperationKind::OutputStreamCancel,
             ]
             .as_slice(),
             UniFfiBackendStreamDirection::Output => [

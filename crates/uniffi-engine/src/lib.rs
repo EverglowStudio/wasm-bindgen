@@ -1002,14 +1002,23 @@ fn validate_executable_plan(operations: &mut [ValidatedOperation]) -> Result<(),
                 )));
             }
             let contract = use_site.contract;
-            if contract.direction
-                != match group
-                    .slot_operation_ids
-                    .contains_key(&WasmOperationKind::OutputStreamStart)
-                {
-                    true => WasmStreamDirection::Output,
-                    false => WasmStreamDirection::Input,
-                }
+            let has_output_start = group
+                .slot_operation_ids
+                .contains_key(&WasmOperationKind::OutputStreamStart);
+            // A direct output stream has a real start operation.  A stream
+            // nested in a record/container is created as part of its parent
+            // operation's return value, so only its pull/cancel operations
+            // are represented in the engine slot table.  The canonical
+            // contract direction is authoritative in both cases; deriving
+            // it from the presence of a start slot incorrectly classified a
+            // nested output as an input stream.
+            let nested_output = contract.direction == WasmStreamDirection::Output
+                && !has_output_start
+                && use_site.path.segments().len() > 1;
+            if (contract.direction == WasmStreamDirection::Input && has_output_start)
+                || (contract.direction == WasmStreamDirection::Output
+                    && !has_output_start
+                    && !nested_output)
                 || !contract.lazy_start
                 || !contract.single_consumer
                 || !contract.serial_pull
@@ -1026,6 +1035,10 @@ fn validate_executable_plan(operations: &mut [ValidatedOperation]) -> Result<(),
                 WasmStreamDirection::Input => &[
                     WasmOperationKind::InputStreamPull,
                     WasmOperationKind::InputStreamCancel,
+                ],
+                WasmStreamDirection::Output if nested_output => &[
+                    WasmOperationKind::OutputStreamNext,
+                    WasmOperationKind::OutputStreamCancel,
                 ],
                 WasmStreamDirection::Output => &[
                     WasmOperationKind::OutputStreamStart,
@@ -2028,6 +2041,153 @@ mod tests {
         assert!(matches!(
             WasmEnginePlan::build(policy(), vec![incomplete_stream]),
             Err(EngineError::InvalidPlan(message)) if message.contains("complete canonical slot")
+        ));
+    }
+
+    fn output_stream_slot_operation(
+        id: u32,
+        kind: WasmOperationKind,
+        hook: WasmResourceHook,
+    ) -> WasmOperationPlan {
+        let mut operation = operation(id);
+        operation.kind = kind;
+        operation.source_key.kind = kind;
+        operation.async_kind = WasmAsyncKind::Async;
+        operation.arguments.clear();
+        operation.receiver = Some(WasmReceiverBinding {
+            rust_type: WasmRustType::Path(
+                RustPath::new(["uniffi".to_owned(), "Handle".to_owned()]).unwrap(),
+            ),
+            carrier: WasmRustCarrier::OutputStream,
+            abi_carrier: WasmCarrier::OpaqueHandle,
+            ownership: WasmOwnership::Borrowed,
+            conversion: WasmConversionRecipe::Identity,
+        });
+        operation.return_value = if kind == WasmOperationKind::OutputStreamCancel {
+            None
+        } else {
+            Some(WasmReturnBinding {
+                rust_type: WasmRustType::StreamStep {
+                    item: Box::new(WasmRustType::Scalar(WasmScalarType::U32)),
+                    error: Box::new(WasmRustType::Scalar(WasmScalarType::String)),
+                },
+                carrier: WasmRustCarrier::StreamStep,
+                abi_carrier: WasmCarrier::JsValue,
+                ownership: WasmOwnership::Owned,
+                conversion: WasmConversionRecipe::StreamStep {
+                    item: Box::new(WasmConversionRecipe::Identity),
+                    error: Box::new(WasmConversionRecipe::Identity),
+                },
+            })
+        };
+        operation.call_target = WasmCallTarget::StreamHook {
+            parent_operation_id: 0,
+            use_site_id: 0,
+            hook,
+        };
+        operation.resource_hooks = vec![hook];
+        operation
+    }
+
+    fn nested_output_group(path: WasmValuePath) -> WasmStreamResourceGroup {
+        let standard = WasmStreamContract {
+            direction: WasmStreamDirection::Output,
+            lazy_start: true,
+            single_consumer: true,
+            serial_pull: true,
+            exactly_once_cleanup: true,
+            explicit_cancel: true,
+            eof_is_distinct_from_item: true,
+        };
+        let scalar = |rust_type, carrier, abi_carrier| WasmValueBinding {
+            rust_type,
+            carrier,
+            abi_carrier,
+            conversion: WasmConversionRecipe::Identity,
+        };
+        WasmStreamResourceGroup {
+            use_site: WasmStreamUseSite {
+                id: 0,
+                operation_id: 0,
+                path,
+                contract: standard,
+            },
+            item: scalar(
+                WasmRustType::Scalar(WasmScalarType::U32),
+                WasmRustCarrier::Primitive,
+                WasmCarrier::U32,
+            ),
+            error: scalar(
+                WasmRustType::Scalar(WasmScalarType::String),
+                WasmRustCarrier::Primitive,
+                WasmCarrier::String,
+            ),
+            is_send: true,
+            hooks: vec![
+                WasmResourceHook::PullOutputStream,
+                WasmResourceHook::CancelOutputStream,
+            ],
+            slot_operation_ids: BTreeMap::from([
+                (WasmOperationKind::OutputStreamNext, 1),
+                (WasmOperationKind::OutputStreamCancel, 2),
+            ]),
+        }
+    }
+
+    #[test]
+    fn nested_output_stream_uses_contract_direction_without_start_slot() {
+        let mut parent = operation(0);
+        parent.stream_resources = vec![nested_output_group(WasmValuePath::new(vec![
+            WasmValuePathSegment::Argument(0),
+            WasmValuePathSegment::Field("payload".to_owned()),
+        ]))];
+        let next = output_stream_slot_operation(
+            1,
+            WasmOperationKind::OutputStreamNext,
+            WasmResourceHook::PullOutputStream,
+        );
+        let cancel = output_stream_slot_operation(
+            2,
+            WasmOperationKind::OutputStreamCancel,
+            WasmResourceHook::CancelOutputStream,
+        );
+        let plan = WasmEnginePlan::build_with_resource_hooks(
+            policy(),
+            vec![parent, next, cancel],
+            WasmEngineResourceHooks {
+                close_output_stream: Some(WasmEngineResourceHook {
+                    rust_call: RustPath::new([
+                        "crate".to_owned(),
+                        "__uniffi_close_output_stream".to_owned(),
+                    ])
+                    .unwrap(),
+                    async_kind: WasmAsyncKind::Sync,
+                    fallible: true,
+                }),
+                ..WasmEngineResourceHooks::default()
+            },
+        )
+        .expect("nested output streams have a canonical two-slot lifecycle");
+        assert_eq!(plan.operation_count(), 3);
+    }
+
+    #[test]
+    fn direct_output_stream_without_start_slot_is_rejected() {
+        let mut parent = operation(0);
+        parent.stream_resources = vec![nested_output_group(WasmValuePath::return_value())];
+        let next = output_stream_slot_operation(
+            1,
+            WasmOperationKind::OutputStreamNext,
+            WasmResourceHook::PullOutputStream,
+        );
+        let cancel = output_stream_slot_operation(
+            2,
+            WasmOperationKind::OutputStreamCancel,
+            WasmResourceHook::CancelOutputStream,
+        );
+        assert!(matches!(
+            WasmEnginePlan::build(policy(), vec![parent, next, cancel]),
+            Err(EngineError::InvalidPlan(message)) if message.contains("non-canonical contract")
         ));
     }
 

@@ -174,7 +174,6 @@ impl TryToTokens for ast::Program {
 
         (quote! {
             #[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
-            #[automatically_derived]
             const _: () = {
                 use #wasm_bindgen::__rt::{flat_len, flat_byte_slices};
 

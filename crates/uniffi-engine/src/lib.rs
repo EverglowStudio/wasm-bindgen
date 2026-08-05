@@ -11,7 +11,7 @@
 //! returns an engine-owned output wrapper.  No external `wasm-bindgen`
 //! executable is inspected or invoked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -23,9 +23,9 @@ use wasm_bindgen_cli_support::{
     UniFfiBackendCallbackContract, UniFfiBackendCallbackReentrancy, UniFfiBackendCallbackRetention,
     UniFfiBackendCallbackThreading, UniFfiBackendCallbackUseSite, UniFfiBackendCarrier,
     UniFfiBackendConfig, UniFfiBackendOperation, UniFfiBackendOperationKind, UniFfiBackendResource,
-    UniFfiBackendResourceExports, UniFfiBackendResourceHook, UniFfiBackendStreamDirection,
-    UniFfiBackendStreamGroup, UniFfiBackendStreamSlot, UniFfiBackendValuePath,
-    UniFfiBackendValuePathSegment,
+    UniFfiBackendResourceExports, UniFfiBackendResourceHook, UniFfiBackendResourceOwnership,
+    UniFfiBackendResourceUseSite, UniFfiBackendStreamDirection, UniFfiBackendStreamGroup,
+    UniFfiBackendStreamSlot, UniFfiBackendValuePath, UniFfiBackendValuePathSegment,
 };
 use wasm_bindgen_macro_support::{ExpansionBuilder, ExpansionContext};
 
@@ -401,9 +401,10 @@ pub enum WasmResourceHook {
     CloseOutputStream,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum WasmValuePathSegment {
     Argument(u32),
+    Receiver,
     Return,
     Field(String),
     Variant(String),
@@ -414,7 +415,7 @@ pub enum WasmValuePathSegment {
     MapValue,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WasmValuePath(Vec<WasmValuePathSegment>);
 
 impl WasmValuePath {
@@ -430,8 +431,46 @@ impl WasmValuePath {
         Self::new(vec![WasmValuePathSegment::Return])
     }
 
+    pub fn receiver() -> Self {
+        Self::new(vec![WasmValuePathSegment::Receiver])
+    }
+
     pub fn segments(&self) -> &[WasmValuePathSegment] {
         &self.0
+    }
+}
+
+/// The resource category carried by an engine-owned object use-site.
+/// Streams retain their dedicated stream-group contract; this DTO is for
+/// object leases embedded anywhere in an operation value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmResourceKind {
+    Object,
+}
+
+/// Ownership expected at an object resource use-site.  Argument/receiver
+/// positions borrow an existing facade lease; return positions own a newly
+/// acquired native handle and therefore publish a lease on success.
+pub type WasmResourceOwnership = WasmOwnership;
+
+/// Complete object-resource path metadata owned by the wasm engine boundary.
+/// It intentionally contains no UniFFI or serialized-schema types.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmResourceUseSite {
+    pub path: WasmValuePath,
+    pub kind: WasmResourceKind,
+    pub type_id: u32,
+    pub ownership: WasmResourceOwnership,
+}
+
+impl WasmResourceUseSite {
+    pub fn object(path: WasmValuePath, type_id: u32, ownership: WasmResourceOwnership) -> Self {
+        Self {
+            path,
+            kind: WasmResourceKind::Object,
+            type_id,
+            ownership,
+        }
     }
 }
 
@@ -563,6 +602,9 @@ pub struct WasmOperationPlan {
     pub async_kind: WasmAsyncKind,
     pub throws: Option<u32>,
     pub callback_use_sites: Vec<WasmCallbackUseSite>,
+    /// Every object lease position, including direct receiver/argument/
+    /// return values and nested record/variant/container selectors.
+    pub resource_use_sites: Vec<WasmResourceUseSite>,
     pub resource_hooks: Vec<WasmResourceHook>,
     pub stream_resources: Vec<WasmStreamResourceGroup>,
 }
@@ -774,6 +816,122 @@ fn validate_executable_plan(operations: &mut [ValidatedOperation]) -> Result<(),
                 )));
             }
             validate_value_path(&operation.plan, &callback.path, "callback")?;
+        }
+        let mut resource_paths = BTreeSet::new();
+        for use_site in &operation.plan.resource_use_sites {
+            if !resource_paths.insert(use_site.path.clone()) {
+                return Err(EngineError::InvalidPlan(format!(
+                    "duplicate object resource use-site path in operation {}",
+                    operation.plan.operation_id
+                )));
+            }
+            validate_value_path(&operation.plan, &use_site.path, "resource")?;
+            if use_site.kind != WasmResourceKind::Object {
+                return Err(EngineError::InvalidPlan(format!(
+                    "resource use-site in operation {} is not an object",
+                    operation.plan.operation_id
+                )));
+            }
+            if use_site.path.segments().iter().skip(1).any(|segment| {
+                matches!(segment, WasmValuePathSegment::Field(name) | WasmValuePathSegment::Variant(name) if name.is_empty())
+            }) {
+                return Err(EngineError::InvalidPlan(format!(
+                    "resource use-site in operation {} has an empty nested selector",
+                    operation.plan.operation_id
+                )));
+            }
+            let root = use_site.path.segments().first().expect("validated path");
+            let (binding_ownership, conversion, expected_ownership) = match root {
+                WasmValuePathSegment::Receiver => {
+                    let Some(receiver) = operation.plan.receiver.as_ref() else {
+                        return Err(EngineError::InvalidPlan(format!(
+                            "resource receiver path in operation {} has no receiver",
+                            operation.plan.operation_id
+                        )));
+                    };
+                    (
+                        receiver.ownership,
+                        &receiver.conversion,
+                        WasmOwnership::Borrowed,
+                    )
+                }
+                WasmValuePathSegment::Argument(index) => {
+                    let argument = &operation.plan.arguments[*index as usize];
+                    (
+                        argument.ownership,
+                        &argument.conversion,
+                        WasmOwnership::Borrowed,
+                    )
+                }
+                WasmValuePathSegment::Return => {
+                    let Some(return_value) = operation.plan.return_value.as_ref() else {
+                        return Err(EngineError::InvalidPlan(format!(
+                            "resource return path in operation {} has no return value",
+                            operation.plan.operation_id
+                        )));
+                    };
+                    (
+                        return_value.ownership,
+                        &return_value.conversion,
+                        WasmOwnership::Owned,
+                    )
+                }
+                _ => unreachable!("validate_value_path checked resource root"),
+            };
+            if binding_ownership != expected_ownership || use_site.ownership != expected_ownership {
+                return Err(EngineError::InvalidPlan(format!(
+                    "resource use-site in operation {} has inconsistent {:?} ownership",
+                    operation.plan.operation_id, root
+                )));
+            }
+            let object_ids = conversion_object_ids(conversion);
+            let direct_object = use_site.path.segments().len() == 1;
+            if (direct_object && (object_ids.is_empty() || !object_ids.contains(&use_site.type_id)))
+                || (!object_ids.is_empty() && !object_ids.contains(&use_site.type_id))
+            {
+                return Err(EngineError::InvalidPlan(format!(
+                    "resource use-site in operation {} has object type ID {} not present in its binding",
+                    operation.plan.operation_id, use_site.type_id
+                )));
+            }
+        }
+        let has_direct_resource = |root: WasmValuePathSegment, type_id: u32| {
+            operation.plan.resource_use_sites.iter().any(|use_site| {
+                use_site.path.segments() == [root.clone()]
+                    && use_site.kind == WasmResourceKind::Object
+                    && use_site.type_id == type_id
+            })
+        };
+        if let Some(receiver) = operation.plan.receiver.as_ref() {
+            if let WasmConversionRecipe::Object(type_id) = &receiver.conversion {
+                if !has_direct_resource(WasmValuePathSegment::Receiver, *type_id) {
+                    return Err(EngineError::InvalidPlan(format!(
+                        "object receiver in operation {} is missing its resource use-site",
+                        operation.plan.operation_id
+                    )));
+                }
+            }
+        }
+        for (index, argument) in operation.plan.arguments.iter().enumerate() {
+            if let WasmConversionRecipe::Object(type_id) = &argument.conversion {
+                let index = u32::try_from(index).map_err(|_| EngineError::TooManyOperations)?;
+                if !has_direct_resource(WasmValuePathSegment::Argument(index), *type_id) {
+                    return Err(EngineError::InvalidPlan(format!(
+                        "object argument {} in operation {} is missing its resource use-site",
+                        index, operation.plan.operation_id
+                    )));
+                }
+            }
+        }
+        if let Some(return_value) = operation.plan.return_value.as_ref() {
+            if let WasmConversionRecipe::Object(type_id) = &return_value.conversion {
+                if !has_direct_resource(WasmValuePathSegment::Return, *type_id) {
+                    return Err(EngineError::InvalidPlan(format!(
+                        "object return in operation {} is missing its resource use-site",
+                        operation.plan.operation_id
+                    )));
+                }
+            }
         }
         for group in &operation.plan.stream_resources {
             let use_site = &group.use_site;
@@ -999,6 +1157,7 @@ fn validate_value_path(
     };
     match root {
         WasmValuePathSegment::Argument(index) if (*index as usize) < operation.arguments.len() => {}
+        WasmValuePathSegment::Receiver if operation.receiver.is_some() => {}
         WasmValuePathSegment::Return => {}
         WasmValuePathSegment::Argument(index) => {
             return Err(EngineError::InvalidPlan(format!(
@@ -1016,7 +1175,9 @@ fn validate_value_path(
     if path.segments().iter().skip(1).any(|segment| {
         matches!(
             segment,
-            WasmValuePathSegment::Argument(_) | WasmValuePathSegment::Return
+            WasmValuePathSegment::Argument(_)
+                | WasmValuePathSegment::Return
+                | WasmValuePathSegment::Receiver
         )
     }) {
         return Err(EngineError::InvalidPlan(format!(
@@ -1025,6 +1186,42 @@ fn validate_value_path(
         )));
     }
     Ok(())
+}
+
+fn conversion_object_ids(conversion: &WasmConversionRecipe) -> BTreeSet<u32> {
+    let mut ids = BTreeSet::new();
+    fn visit(conversion: &WasmConversionRecipe, ids: &mut BTreeSet<u32>) {
+        match conversion {
+            WasmConversionRecipe::Object(type_id) => {
+                ids.insert(*type_id);
+            }
+            WasmConversionRecipe::Optional(inner)
+            | WasmConversionRecipe::Sequence(inner)
+            | WasmConversionRecipe::Set(inner)
+            | WasmConversionRecipe::InputStream(inner)
+            | WasmConversionRecipe::OutputStream(inner)
+            | WasmConversionRecipe::Custom(_, inner) => visit(inner, ids),
+            WasmConversionRecipe::Map(key, value)
+            | WasmConversionRecipe::StreamStep {
+                item: key,
+                error: value,
+            } => {
+                visit(key, ids);
+                visit(value, ids);
+            }
+            WasmConversionRecipe::Identity
+            | WasmConversionRecipe::Timestamp
+            | WasmConversionRecipe::Duration
+            | WasmConversionRecipe::BigInt
+            | WasmConversionRecipe::Bytes
+            | WasmConversionRecipe::Record(_)
+            | WasmConversionRecipe::Enum(_)
+            | WasmConversionRecipe::Error(_)
+            | WasmConversionRecipe::Callback(_) => {}
+        }
+    }
+    visit(conversion, &mut ids);
+    ids
 }
 
 fn backend_config(
@@ -1056,12 +1253,12 @@ fn backend_config(
                 .iter()
                 .map(backend_stream_group)
                 .collect();
-            let receiver_resource = operation.plan.receiver.as_ref().and_then(|binding| {
-                backend_resource(binding.carrier, &binding.conversion, operation)
-            });
-            let return_resource = operation.plan.return_value.as_ref().and_then(|binding| {
-                backend_resource(binding.carrier, &binding.conversion, operation)
-            });
+            let resource_use_sites = operation
+                .plan
+                .resource_use_sites
+                .iter()
+                .map(backend_resource_use_site)
+                .collect();
             UniFfiBackendOperation::new(
                 operation.plan.operation_id,
                 operation.raw_export_name.clone(),
@@ -1091,11 +1288,11 @@ fn backend_config(
                 };
                 backend
                     .with_host_argument(operation_requires_host(&operation.plan))
+                    .with_receiver(operation.plan.receiver.is_some())
                     .with_callback_use_sites(callback_use_sites)
                     .with_stream_groups(stream_groups)
                     .with_stream_slot(operation.stream_slot.clone())
-                    .with_receiver_resource(receiver_resource)
-                    .with_return_resource(return_resource)
+                    .with_resource_use_sites(resource_use_sites)
                     .with_resource_hooks(
                         operation
                             .plan
@@ -1206,6 +1403,7 @@ fn backend_path(path: &WasmValuePath) -> UniFfiBackendValuePath {
                 WasmValuePathSegment::Argument(index) => {
                     UniFfiBackendValuePathSegment::Argument(*index)
                 }
+                WasmValuePathSegment::Receiver => UniFfiBackendValuePathSegment::Receiver,
                 WasmValuePathSegment::Return => UniFfiBackendValuePathSegment::Return,
                 WasmValuePathSegment::Field(name) => {
                     UniFfiBackendValuePathSegment::Field(name.clone())
@@ -1279,22 +1477,16 @@ fn backend_stream_group(group: &WasmStreamResourceGroup) -> UniFfiBackendStreamG
     }
 }
 
-fn backend_resource(
-    carrier: WasmRustCarrier,
-    conversion: &WasmConversionRecipe,
-    operation: &ValidatedOperation,
-) -> Option<UniFfiBackendResource> {
-    match (carrier, conversion) {
-        (_, WasmConversionRecipe::Object(type_id)) => Some(UniFfiBackendResource::Object(*type_id)),
-        (WasmRustCarrier::InputStream, _) => operation
-            .stream_slot
-            .as_ref()
-            .map(|slot| UniFfiBackendResource::InputStream(slot.use_site_id)),
-        (WasmRustCarrier::OutputStream, _) => operation
-            .stream_slot
-            .as_ref()
-            .map(|slot| UniFfiBackendResource::OutputStream(slot.use_site_id)),
-        _ => None,
+fn backend_resource_use_site(use_site: &WasmResourceUseSite) -> UniFfiBackendResourceUseSite {
+    UniFfiBackendResourceUseSite {
+        path: backend_path(&use_site.path),
+        kind: match use_site.kind {
+            WasmResourceKind::Object => UniFfiBackendResource::Object(use_site.type_id),
+        },
+        ownership: match use_site.ownership {
+            WasmOwnership::Borrowed => UniFfiBackendResourceOwnership::Borrowed,
+            WasmOwnership::Owned => UniFfiBackendResourceOwnership::Owned,
+        },
     }
 }
 
@@ -1591,6 +1783,7 @@ mod tests {
             async_kind: WasmAsyncKind::Sync,
             throws: None,
             callback_use_sites: Vec::new(),
+            resource_use_sites: Vec::new(),
             resource_hooks: Vec::new(),
             stream_resources: Vec::new(),
         }
@@ -1714,6 +1907,12 @@ mod tests {
         result.carrier = WasmRustCarrier::OpaqueHandle;
         result.abi_carrier = WasmCarrier::OpaqueHandle;
         result.conversion = WasmConversionRecipe::Object(9);
+        object.resource_use_sites.push(WasmResourceUseSite {
+            path: WasmValuePath::return_value(),
+            kind: WasmResourceKind::Object,
+            type_id: 9,
+            ownership: WasmOwnership::Owned,
+        });
         assert!(matches!(
             WasmEnginePlan::build(policy(), vec![object]),
             Err(EngineError::Surface(message)) if message.contains("explicit object release export")

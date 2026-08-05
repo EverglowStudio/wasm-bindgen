@@ -69,10 +69,17 @@ pub enum UniFfiBackendResourceHook {
     CloseOutputStream,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]
 pub enum UniFfiBackendValuePathSegment {
     Argument(u32),
+    /// The implicit receiver slot that precedes ordinary arguments.
+    ///
+    /// Keeping the receiver as a path root is important for object methods:
+    /// resource conversion must not infer a special top-level field from the
+    /// carrier.  The backend session can therefore apply the same recursive
+    /// path walker to receivers and ordinary arguments.
+    Receiver,
     Return,
     Field(String),
     Variant(String),
@@ -83,7 +90,7 @@ pub enum UniFfiBackendValuePathSegment {
     MapValue,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct UniFfiBackendValuePath(Vec<UniFfiBackendValuePathSegment>);
 
 impl UniFfiBackendValuePath {
@@ -93,6 +100,10 @@ impl UniFfiBackendValuePath {
 
     pub fn argument(index: u32) -> Self {
         Self::new(vec![UniFfiBackendValuePathSegment::Argument(index)])
+    }
+
+    pub fn receiver() -> Self {
+        Self::new(vec![UniFfiBackendValuePathSegment::Receiver])
     }
 
     pub fn return_value() -> Self {
@@ -179,6 +190,41 @@ pub enum UniFfiBackendResource {
     OutputStream(u32),
 }
 
+/// Whether an object use-site borrows an existing session lease or owns a
+/// newly returned native handle.  This is deliberately a two-value DTO: the
+/// engine/frontend has already selected the concrete ownership semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UniFfiBackendResourceOwnership {
+    Borrowed,
+    Owned,
+}
+
+/// One object resource position in an operation value.  `path` is complete,
+/// including nested record/variant/optional/sequence/set/map selectors; there
+/// are no receiver/return shortcut fields on the operation itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniFfiBackendResourceUseSite {
+    pub path: UniFfiBackendValuePath,
+    pub kind: UniFfiBackendResource,
+    pub ownership: UniFfiBackendResourceOwnership,
+}
+
+impl UniFfiBackendResourceUseSite {
+    pub fn object(
+        path: UniFfiBackendValuePath,
+        type_id: u32,
+        ownership: UniFfiBackendResourceOwnership,
+    ) -> Self {
+        Self {
+            path,
+            kind: UniFfiBackendResource::Object(type_id),
+            ownership,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UniFfiBackendCallbackDispatch {
@@ -204,8 +250,8 @@ pub struct UniFfiBackendOperation {
     callback_use_sites: Vec<UniFfiBackendCallbackUseSite>,
     stream_groups: Vec<UniFfiBackendStreamGroup>,
     stream_slot: Option<UniFfiBackendStreamSlot>,
-    receiver_resource: Option<UniFfiBackendResource>,
-    return_resource: Option<UniFfiBackendResource>,
+    has_receiver: bool,
+    resource_use_sites: Vec<UniFfiBackendResourceUseSite>,
     resource_hooks: Vec<UniFfiBackendResourceHook>,
 }
 
@@ -238,8 +284,8 @@ impl UniFfiBackendOperation {
             callback_use_sites: Vec::new(),
             stream_groups: Vec::new(),
             stream_slot: None,
-            receiver_resource: None,
-            return_resource: None,
+            has_receiver: false,
+            resource_use_sites: Vec::new(),
             resource_hooks: Vec::new(),
         })
     }
@@ -275,16 +321,16 @@ impl UniFfiBackendOperation {
         self
     }
 
-    pub fn with_receiver_resource(
-        mut self,
-        receiver_resource: Option<UniFfiBackendResource>,
-    ) -> Self {
-        self.receiver_resource = receiver_resource;
+    pub fn with_receiver(mut self, has_receiver: bool) -> Self {
+        self.has_receiver = has_receiver;
         self
     }
 
-    pub fn with_return_resource(mut self, return_resource: Option<UniFfiBackendResource>) -> Self {
-        self.return_resource = return_resource;
+    pub fn with_resource_use_sites(
+        mut self,
+        resource_use_sites: Vec<UniFfiBackendResourceUseSite>,
+    ) -> Self {
+        self.resource_use_sites = resource_use_sites;
         self
     }
 
@@ -299,6 +345,14 @@ impl UniFfiBackendOperation {
 
     pub fn raw_export_name(&self) -> &str {
         &self.raw_export_name
+    }
+
+    pub fn has_receiver(&self) -> bool {
+        self.has_receiver
+    }
+
+    pub fn resource_use_sites(&self) -> &[UniFfiBackendResourceUseSite] {
+        &self.resource_use_sites
     }
 }
 
@@ -446,10 +500,10 @@ impl UniFfiBackendConfig {
             }
         }
         let needs_object_release = operations.iter().any(|operation| {
-            matches!(
-                operation.return_resource,
-                Some(UniFfiBackendResource::Object(_))
-            )
+            operation.resource_use_sites.iter().any(|use_site| {
+                use_site.ownership == UniFfiBackendResourceOwnership::Owned
+                    && matches!(use_site.kind, UniFfiBackendResource::Object(_))
+            })
         });
         if needs_object_release && resource_exports.release_object_export_name().is_none() {
             bail!("UniFFI object results require an explicit object release export");
@@ -514,6 +568,90 @@ fn validate_uniffi_backend_operation(
             "UniFFI callback Host operation {} cannot also receive the engine Host argument",
             operation.operation_id
         );
+    }
+    if operation
+        .resource_use_sites
+        .iter()
+        .filter(|use_site| use_site.path.segments().is_empty())
+        .count()
+        != 0
+    {
+        bail!(
+            "UniFFI operation {} has an empty object resource value path",
+            operation.operation_id
+        );
+    }
+    let mut resource_paths = HashSet::new();
+    for use_site in &operation.resource_use_sites {
+        if !resource_paths.insert(use_site.path.clone()) {
+            bail!(
+                "UniFFI operation {} has duplicate object resource use-site paths",
+                operation.operation_id
+            );
+        }
+        let root = use_site.path.segments().first().expect("checked above");
+        match root {
+            UniFfiBackendValuePathSegment::Receiver if !operation.has_receiver => bail!(
+                "UniFFI object resource receiver path is invalid for operation {}",
+                operation.operation_id
+            ),
+            UniFfiBackendValuePathSegment::Argument(index)
+                if (*index as usize) >= operation.argument_count =>
+            {
+                bail!(
+                    "UniFFI object resource argument {} is out of range for operation {}",
+                    index,
+                    operation.operation_id
+                )
+            }
+            UniFfiBackendValuePathSegment::Argument(_)
+            | UniFfiBackendValuePathSegment::Receiver
+            | UniFfiBackendValuePathSegment::Return => {}
+            _ => bail!(
+                "UniFFI object resource path for operation {} has an invalid root",
+                operation.operation_id
+            ),
+        }
+        if !matches!(use_site.kind, UniFfiBackendResource::Object(_)) {
+            bail!(
+                "UniFFI operation {} has a non-object resource use-site",
+                operation.operation_id
+            );
+        }
+        if use_site.path.segments().iter().skip(1).any(|segment| {
+            matches!(segment, UniFfiBackendValuePathSegment::Field(name) | UniFfiBackendValuePathSegment::Variant(name) if name.is_empty())
+        }) {
+            bail!(
+                "UniFFI operation {} has an empty object resource path selector",
+                operation.operation_id
+            );
+        }
+        let is_return = matches!(root, UniFfiBackendValuePathSegment::Return);
+        let expected = if is_return {
+            UniFfiBackendResourceOwnership::Owned
+        } else {
+            UniFfiBackendResourceOwnership::Borrowed
+        };
+        if use_site.ownership != expected {
+            bail!(
+                "UniFFI object resource use-site in operation {} has invalid {:?} ownership for its root",
+                operation.operation_id,
+                root
+            );
+        }
+        if use_site.path.segments().iter().skip(1).any(|segment| {
+            matches!(
+                segment,
+                UniFfiBackendValuePathSegment::Argument(_)
+                    | UniFfiBackendValuePathSegment::Receiver
+                    | UniFfiBackendValuePathSegment::Return
+            )
+        }) {
+            bail!(
+                "UniFFI object resource path for operation {} has a nested root segment",
+                operation.operation_id
+            );
+        }
     }
     if matches!(
         operation.kind,
@@ -643,6 +781,7 @@ fn validate_uniffi_value_path(
     match root {
         UniFfiBackendValuePathSegment::Argument(index)
             if (*index as usize) < operation.argument_count => {}
+        UniFfiBackendValuePathSegment::Receiver if operation.has_receiver => {}
         UniFfiBackendValuePathSegment::Return => {}
         UniFfiBackendValuePathSegment::Argument(index) => bail!(
             "UniFFI {role} use-site argument {} is out of range for operation {}",
@@ -657,7 +796,9 @@ fn validate_uniffi_value_path(
     if path.segments().iter().skip(1).any(|segment| {
         matches!(
             segment,
-            UniFfiBackendValuePathSegment::Argument(_) | UniFfiBackendValuePathSegment::Return
+            UniFfiBackendValuePathSegment::Argument(_)
+                | UniFfiBackendValuePathSegment::Receiver
+                | UniFfiBackendValuePathSegment::Return
         )
     }) {
         bail!(

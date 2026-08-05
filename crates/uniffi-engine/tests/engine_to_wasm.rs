@@ -10,10 +10,10 @@ use wasm_bindgen_uniffi_engine::{
     WasmCallbackContract, WasmCallbackReentrancy, WasmCallbackRetention, WasmCallbackThreading,
     WasmCallbackUseSite, WasmCarrier, WasmConversionRecipe, WasmEnginePlan, WasmEngineResourceHook,
     WasmEngineResourceHooks, WasmOperationKind, WasmOperationOwner, WasmOperationPlan,
-    WasmOperationSourceKey, WasmOwnership, WasmReceiverBinding, WasmResourceHook,
-    WasmReturnBinding, WasmRustCarrier, WasmRustType, WasmScalarType, WasmStreamContract,
-    WasmStreamDirection, WasmStreamResourceGroup, WasmStreamUseSite, WasmValueBinding,
-    WasmValuePath, WasmValuePathSegment, DEFAULT_BACKEND_FACTORY,
+    WasmOperationSourceKey, WasmOwnership, WasmReceiverBinding, WasmResourceHook, WasmResourceKind,
+    WasmResourceUseSite, WasmReturnBinding, WasmRustCarrier, WasmRustType, WasmScalarType,
+    WasmStreamContract, WasmStreamDirection, WasmStreamResourceGroup, WasmStreamUseSite,
+    WasmValueBinding, WasmValuePath, WasmValuePathSegment, DEFAULT_BACKEND_FACTORY,
 };
 
 const FIXTURE_NAME: &str = "uniffi_wasm_engine_fixture";
@@ -79,6 +79,20 @@ fn engine_plan() -> WasmEnginePlan {
         }
     }
 
+    fn js_argument(name: &str, conversion: WasmConversionRecipe) -> WasmArgumentBinding {
+        WasmArgumentBinding {
+            public_name: name.to_owned(),
+            rust_name: name.to_owned(),
+            rust_type: WasmRustType::Path(
+                RustPath::new(["wasm_bindgen".to_owned(), "JsValue".to_owned()]).unwrap(),
+            ),
+            carrier: WasmRustCarrier::LocalAdapter,
+            abi_carrier: WasmCarrier::JsValue,
+            ownership: WasmOwnership::Borrowed,
+            conversion,
+        }
+    }
+
     fn operation(
         operation_id: u32,
         name: &str,
@@ -111,9 +125,49 @@ fn engine_plan() -> WasmEnginePlan {
             async_kind,
             throws,
             callback_use_sites: Vec::new(),
+            resource_use_sites: Vec::new(),
             resource_hooks: Vec::new(),
             stream_resources: Vec::new(),
         }
+    }
+
+    fn nested_object_operation(
+        operation_id: u32,
+        name: &str,
+        conversion: WasmConversionRecipe,
+        selectors: Vec<WasmValuePathSegment>,
+        async_kind: WasmAsyncKind,
+    ) -> WasmOperationPlan {
+        let mut operation = operation(
+            operation_id,
+            name,
+            vec![js_argument("value", conversion.clone())],
+            Some(js_return(WasmRustCarrier::LocalAdapter, conversion)),
+            async_kind,
+            None,
+        );
+        operation.resource_use_sites = vec![
+            WasmResourceUseSite::object(
+                WasmValuePath::new(
+                    std::iter::once(WasmValuePathSegment::Argument(0))
+                        .chain(selectors.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                42,
+                WasmOwnership::Borrowed,
+            ),
+            WasmResourceUseSite::object(
+                WasmValuePath::new(
+                    std::iter::once(WasmValuePathSegment::Return)
+                        .chain(selectors)
+                        .collect::<Vec<_>>(),
+                ),
+                42,
+                WasmOwnership::Owned,
+            ),
+        ];
+        operation.resource_hooks = vec![WasmResourceHook::AcquireObject];
+        operation
     }
 
     fn receiver(carrier: WasmRustCarrier, conversion: WasmConversionRecipe) -> WasmReceiverBinding {
@@ -451,6 +505,12 @@ fn engine_plan() -> WasmEnginePlan {
         WasmAsyncKind::Sync,
         None,
     );
+    object.resource_use_sites.push(WasmResourceUseSite {
+        path: WasmValuePath::return_value(),
+        kind: WasmResourceKind::Object,
+        type_id: 42,
+        ownership: WasmOwnership::Owned,
+    });
     object.resource_hooks = vec![WasmResourceHook::AcquireObject];
     operations.push(object);
 
@@ -483,6 +543,12 @@ fn engine_plan() -> WasmEnginePlan {
         WasmAsyncKind::Async,
         None,
     );
+    late_object.resource_use_sites.push(WasmResourceUseSite {
+        path: WasmValuePath::return_value(),
+        kind: WasmResourceKind::Object,
+        type_id: 42,
+        ownership: WasmOwnership::Owned,
+    });
     late_object.resource_hooks = vec![WasmResourceHook::AcquireObject];
     operations.push(late_object);
 
@@ -735,6 +801,129 @@ fn engine_plan() -> WasmEnginePlan {
     output_only_cancel.resource_hooks = vec![WasmResourceHook::CancelOutputStream];
     operations.push(output_only_cancel);
 
+    operations.push(nested_object_operation(
+        26,
+        "aa_nested_record",
+        WasmConversionRecipe::Record(100),
+        vec![WasmValuePathSegment::Field("object".to_owned())],
+        WasmAsyncKind::Sync,
+    ));
+    operations.push(nested_object_operation(
+        27,
+        "ab_nested_optional",
+        WasmConversionRecipe::Optional(Box::new(WasmConversionRecipe::Object(42))),
+        vec![WasmValuePathSegment::Optional],
+        WasmAsyncKind::Async,
+    ));
+    operations.push(nested_object_operation(
+        28,
+        "ac_nested_sequence",
+        WasmConversionRecipe::Sequence(Box::new(WasmConversionRecipe::Object(42))),
+        vec![WasmValuePathSegment::SequenceItem],
+        WasmAsyncKind::Sync,
+    ));
+    operations.push(nested_object_operation(
+        29,
+        "ad_nested_map",
+        WasmConversionRecipe::Map(
+            Box::new(WasmConversionRecipe::Object(42)),
+            Box::new(WasmConversionRecipe::Object(42)),
+        ),
+        vec![WasmValuePathSegment::MapKey],
+        WasmAsyncKind::Sync,
+    ));
+    // Add the map-value use-site to the same operation so both sides of a
+    // Map are lowered by the one backend walker.
+    operations[29].resource_use_sites.insert(
+        1,
+        WasmResourceUseSite::object(
+            WasmValuePath::new(vec![
+                WasmValuePathSegment::Argument(0),
+                WasmValuePathSegment::MapValue,
+            ]),
+            42,
+            WasmOwnership::Borrowed,
+        ),
+    );
+    operations[29]
+        .resource_use_sites
+        .push(WasmResourceUseSite::object(
+            WasmValuePath::new(vec![
+                WasmValuePathSegment::Return,
+                WasmValuePathSegment::MapValue,
+            ]),
+            42,
+            WasmOwnership::Owned,
+        ));
+    operations.push(nested_object_operation(
+        30,
+        "ae_nested_set",
+        WasmConversionRecipe::Set(Box::new(WasmConversionRecipe::Object(42))),
+        vec![WasmValuePathSegment::SetItem],
+        WasmAsyncKind::Async,
+    ));
+    let mut object_method = operation(
+        31,
+        "af_object_method",
+        vec![scalar_binding(
+            "value",
+            WasmScalarType::U32,
+            WasmCarrier::U32,
+        )],
+        Some(scalar_return(WasmScalarType::U32, WasmCarrier::U32)),
+        WasmAsyncKind::Sync,
+        None,
+    );
+    object_method.kind = WasmOperationKind::Method;
+    object_method.source_key.kind = WasmOperationKind::Method;
+    object_method.receiver = Some(receiver(
+        WasmRustCarrier::OpaqueHandle,
+        WasmConversionRecipe::Object(42),
+    ));
+    object_method.call_target = WasmCallTarget::Method {
+        object: RustPath::new(["fixture".to_owned(), "Object".to_owned()]).unwrap(),
+        object_kind: wasm_bindgen_uniffi_engine::WasmObjectKind::Struct,
+        callback_method_id: None,
+        item: "af_object_method".to_owned(),
+    };
+    object_method
+        .resource_use_sites
+        .push(WasmResourceUseSite::object(
+            WasmValuePath::receiver(),
+            42,
+            WasmOwnership::Borrowed,
+        ));
+    operations.push(object_method);
+    operations.push(nested_object_operation(
+        32,
+        "ag_nested_variant",
+        WasmConversionRecipe::Enum(101),
+        vec![
+            WasmValuePathSegment::Variant("withObject".to_owned()),
+            WasmValuePathSegment::Field("object".to_owned()),
+        ],
+        WasmAsyncKind::Sync,
+    ));
+    operations.push(nested_object_operation(
+        33,
+        "ah_late_nested_record",
+        WasmConversionRecipe::Record(100),
+        vec![WasmValuePathSegment::Field("object".to_owned())],
+        WasmAsyncKind::Async,
+    ));
+    operations.push(operation(
+        34,
+        "ai_release_handle_count",
+        vec![scalar_binding(
+            "handle",
+            WasmScalarType::U32,
+            WasmCarrier::U32,
+        )],
+        Some(scalar_return(WasmScalarType::U32, WasmCarrier::U32)),
+        WasmAsyncKind::Sync,
+        None,
+    ));
+
     WasmEnginePlan::build_with_resource_hooks(
         wasm_bindgen_uniffi_engine::ClosePolicy {
             // Real conformance uses a short policy so a deliberately stuck
@@ -801,6 +990,7 @@ mod fixture {{
     #[derive(Default)]
     struct State {{
         release: u32,
+        released_handles: BTreeMap<u32, u32>,
         cancel: u32,
         close: u32,
         pulls: BTreeMap<u32, u32>,
@@ -956,6 +1146,19 @@ mod fixture {{
         }})
     }}
     pub async fn q_late_object(handle: u32) -> u32 {{ handle }}
+    pub fn aa_nested_record(value: JsValue) -> JsValue {{ value }}
+    pub async fn ab_nested_optional(value: JsValue) -> JsValue {{ value }}
+    pub fn ac_nested_sequence(value: JsValue) -> JsValue {{ value }}
+    pub fn ad_nested_map(value: JsValue) -> JsValue {{ value }}
+    pub async fn ae_nested_set(value: JsValue) -> JsValue {{ value }}
+    pub fn af_object_method(receiver: u32, value: u32) -> u32 {{ receiver + value }}
+    pub fn ag_nested_variant(value: JsValue) -> JsValue {{ value }}
+    pub async fn ah_late_nested_record(_value: JsValue) -> JsValue {{
+        wait_for_test_gate().await;
+        let object = Object::new();
+        Reflect::set(&object, &JsValue::from_str("object"), &JsValue::from_f64(900.0)).unwrap();
+        object.into()
+    }}
     pub fn r_register_callback_fallible(_host: JsValue, callback_id: u32) -> Result<u32, JsValue> {{
         Err(JsValue::from_str(&format!("reject callback {{callback_id}}")))
     }}
@@ -991,7 +1194,15 @@ mod fixture {{
         if handle == 703 {{
             std::future::pending::<()>().await;
         }}
-        STATE.with(|state| state.borrow_mut().release += 1);
+        STATE.with(|state| {{
+            let mut state = state.borrow_mut();
+            state.release += 1;
+            *state.released_handles.entry(handle).or_default() += 1;
+        }});
+    }}
+
+    pub fn ai_release_handle_count(handle: u32) -> u32 {{
+        STATE.with(|state| state.borrow().released_handles.get(&handle).copied().unwrap_or(0))
     }}
 
     pub async fn close_output_stream(handle: u32) {{
@@ -1086,7 +1297,7 @@ import assert from 'node:assert/strict';
 {imports}
 
 for (const raw of [
-    ...Array.from({{ length: 26 }}, (_, index) => `__uniffi_operation_${{index}}`),
+    ...Array.from({{ length: 35 }}, (_, index) => `__uniffi_operation_${{index}}`),
     '__uniffi_release_object',
     '__uniffi_close_output_stream',
 ]) {{
@@ -1147,7 +1358,7 @@ const host = {{
 
 session = api.{DEFAULT_BACKEND_FACTORY}(host);
 assert.deepEqual(Object.keys(session).sort(), ['cancelOutputStream', 'close', 'info', 'invokeAsync', 'invokeSync', 'releaseObject', 'releaseOutputStream'].sort());
-assert.equal(session.info.operationCount, 26);
+assert.equal(session.info.operationCount, 35);
 assert.equal(session.invokeSync(0, ['sum', new Uint8Array([1, 2, 3, 4])]), 'sum:10');
 const pending = session.invokeAsync(1, ['bytes']);
 assert.equal(typeof pending.then, 'function');
@@ -1237,6 +1448,69 @@ assert.equal(inspector.invokeSync(4, [41]), 41);
 assert.equal(await inspector.invokeAsync(7, [41, 'next-session']), 'async-2:next-session');
 assert.equal(callbackInvocations.at(-1)[2], 1);
 await inspector.close();
+
+// Nested object resource paths use the same backend walker for records,
+// optional values, sequences, maps (both keys and values), and sets.
+const nestedSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const recordLease = nestedSession.invokeSync(14, [710]);
+const recordResult = nestedSession.invokeSync(26, [{{ object: recordLease }}]);
+assert.equal(recordResult.object.handle, 710);
+nestedSession.releaseObject(recordResult.object);
+nestedSession.releaseObject(recordLease);
+assert.equal(await nestedSession.invokeAsync(27, [null]), null);
+const optionalLease = nestedSession.invokeSync(14, [711]);
+const optionalResult = await nestedSession.invokeAsync(27, [optionalLease]);
+assert.equal(optionalResult.handle, 711);
+nestedSession.releaseObject(optionalResult);
+nestedSession.releaseObject(optionalLease);
+const sequenceLease = nestedSession.invokeSync(14, [712]);
+const sequenceResult = nestedSession.invokeSync(28, [[sequenceLease]]);
+assert.equal(sequenceResult[0].handle, 712);
+nestedSession.releaseObject(sequenceResult[0]);
+nestedSession.releaseObject(sequenceLease);
+const mapKey = nestedSession.invokeSync(14, [713]);
+const mapValue = nestedSession.invokeSync(14, [714]);
+const map = new Map([[mapKey, mapValue]]);
+const mapResult = nestedSession.invokeSync(29, [map]);
+assert.equal(Array.from(mapResult.keys())[0].handle, 713);
+assert.equal(Array.from(mapResult.values())[0].handle, 714);
+nestedSession.releaseObject(Array.from(mapResult.keys())[0]);
+nestedSession.releaseObject(Array.from(mapResult.values())[0]);
+nestedSession.releaseObject(mapKey);
+nestedSession.releaseObject(mapValue);
+const setLease = nestedSession.invokeSync(14, [715]);
+const setResult = await nestedSession.invokeAsync(30, [new Set([setLease])]);
+assert.equal(Array.from(setResult)[0].handle, 715);
+nestedSession.releaseObject(Array.from(setResult)[0]);
+nestedSession.releaseObject(setLease);
+const receiverLease = nestedSession.invokeSync(14, [716]);
+assert.equal(nestedSession.invokeSync(31, [receiverLease, 4]), 720);
+nestedSession.releaseObject(receiverLease);
+const alternateVariantLease = nestedSession.invokeSync(14, [717]);
+const alternateVariant = nestedSession.invokeSync(32, [{{ tag: 'other', object: alternateVariantLease }}]);
+assert.equal(alternateVariant.object, alternateVariantLease);
+assert.throws(() => nestedSession.invokeSync(32, [{{ object: alternateVariantLease }}]), /discriminant/);
+nestedSession.releaseObject(alternateVariantLease);
+const matchingVariantLease = nestedSession.invokeSync(14, [718]);
+const matchingVariant = nestedSession.invokeSync(32, [{{ tag: 'withObject', object: matchingVariantLease }}]);
+assert.equal(matchingVariant.object.handle, 718);
+nestedSession.releaseObject(matchingVariant.object);
+nestedSession.releaseObject(matchingVariantLease);
+await nestedSession.close();
+let releaseNestedGate;
+globalThis.__uniffi_test_gate = new Promise((resolve) => {{ releaseNestedGate = resolve; }});
+const lateNestedSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const lateNestedArgument = lateNestedSession.invokeSync(14, [719]);
+const lateNested = lateNestedSession.invokeAsync(33, [{{ object: lateNestedArgument }}]);
+const lateNestedClose = lateNestedSession.close();
+setTimeout(() => releaseNestedGate(), 5);
+await assert.rejects(lateNested, /closed/);
+await lateNestedClose;
+delete globalThis.__uniffi_test_gate;
+const releaseInspector = api.{DEFAULT_BACKEND_FACTORY}(host);
+assert.equal(releaseInspector.invokeSync(34, [900]), 1);
+assert.equal(releaseInspector.invokeSync(34, [719]), 1);
+await releaseInspector.close();
 
 // Reentrant close from a synchronous callback keeps the in-flight invocation
 // on its original generation; only the next call is rejected.

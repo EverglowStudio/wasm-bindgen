@@ -157,7 +157,7 @@ function $FACTORY$(host) {
 
     function validateArgs(operation, args) {
         if (!Array.isArray(args)) throw new TypeError('UniFFI operation args must be an Array');
-        const implicit = operation.callbackDispatch !== null || operation.receiverResource !== null ? 1 : 0;
+        const implicit = operation.callbackDispatch !== null || operation.hasReceiver ? 1 : 0;
         const expected = operation.argumentCount + implicit;
         if (args.length !== expected) throw new TypeError(`UniFFI operation ${operation.operationId} expected ${expected} arguments, got ${args.length}`);
     }
@@ -167,6 +167,7 @@ function $FACTORY$(host) {
         const root = path[0];
         let values;
         if (root.kind === 'argument') values = [args[root.value + receiverOffset]];
+        else if (root.kind === 'receiver') values = [args[0]];
         else if (root.kind === 'return') values = [result];
         else throw new TypeError('invalid UniFFI value path root');
         for (const segment of path.slice(1)) {
@@ -181,7 +182,7 @@ function $FACTORY$(host) {
                     if (value === null || typeof value !== 'object') throw new TypeError(`invalid UniFFI variant path segment ${segment.value}`);
                     const tag = typeof value.tag === 'string' ? value.tag : null;
                     if (tag === null) throw new TypeError(`missing UniFFI variant discriminant for ${segment.value}`);
-                    if (tag !== segment.value) throw new TypeError(`unexpected UniFFI variant ${tag}, expected ${segment.value}`);
+                    if (tag !== segment.value) continue;
                     next.push(value);
                 } else if (segment.kind === 'sequenceItem') {
                     if (!Array.isArray(value)) throw new TypeError('invalid UniFFI sequence path segment');
@@ -202,6 +203,118 @@ function $FACTORY$(host) {
             values = next;
         }
         return values;
+    }
+
+    function isLease(value) {
+        return value !== null && typeof value === 'object' && value.surfaceId === 'base' && Number.isInteger(value.leaseId);
+    }
+
+    // Rewrite one complete value path while preserving the public container
+    // shape.  Records/variants are copied as plain objects, arrays remain
+    // arrays, and Set/Map retain their native collection semantics.
+    function rewriteResourceValue(value, segments, transform) {
+        if (segments.length === 0) return transform(value);
+        const [segment, ...rest] = segments;
+        if (segment.kind === 'optional') {
+            if (value === null || value === undefined) return value;
+            return rewriteResourceValue(value, rest, transform);
+        }
+        if (segment.kind === 'field') {
+            if (value === null || typeof value !== 'object' || Array.isArray(value) || !Object.hasOwn(value, segment.value)) throw new TypeError(`invalid UniFFI field resource path segment ${segment.value}`);
+            const clone = Object.assign(Object.create(Object.getPrototypeOf(value)), value);
+            clone[segment.value] = rewriteResourceValue(value[segment.value], rest, transform);
+            return clone;
+        }
+        if (segment.kind === 'variant') {
+            if (value === null || typeof value !== 'object') throw new TypeError(`invalid UniFFI variant resource path segment ${segment.value}`);
+            const tag = typeof value.tag === 'string' ? value.tag : null;
+            if (tag === null) throw new TypeError(`missing UniFFI variant discriminant for ${segment.value}`);
+            if (tag !== segment.value) return value;
+            return rewriteResourceValue(value, rest, transform);
+        }
+        if (segment.kind === 'sequenceItem') {
+            if (!Array.isArray(value)) throw new TypeError('invalid UniFFI sequence resource path segment');
+            return value.map((item) => rewriteResourceValue(item, rest, transform));
+        }
+        if (segment.kind === 'setItem') {
+            if (!(value instanceof Set)) throw new TypeError('invalid UniFFI set resource path segment');
+            return new Set(Array.from(value.values(), (item) => rewriteResourceValue(item, rest, transform)));
+        }
+        if (segment.kind === 'mapKey') {
+            if (!(value instanceof Map)) throw new TypeError('invalid UniFFI map-key resource path segment');
+            return new Map(Array.from(value.entries(), ([key, item]) => [rewriteResourceValue(key, rest, transform), item]));
+        }
+        if (segment.kind === 'mapValue') {
+            if (!(value instanceof Map)) throw new TypeError('invalid UniFFI map-value resource path segment');
+            return new Map(Array.from(value.entries(), ([key, item]) => [key, rewriteResourceValue(item, rest, transform)]));
+        }
+        throw new TypeError(`unknown UniFFI resource path segment ${String(segment.kind)}`);
+    }
+
+    function resourceTypeId(useSite) {
+        if (useSite.kind?.kind !== 'object') throw new TypeError('invalid UniFFI object resource use-site kind');
+        return useSite.kind.id;
+    }
+
+    function rewriteArgumentResources(operation, args) {
+        const raw = args.slice();
+        const receiverOffset = operation.hasReceiver ? 1 : 0;
+        for (const useSite of operation.resourceUseSites) {
+            const root = useSite.path[0];
+            if (root?.kind === 'return') continue;
+            const index = root?.kind === 'receiver' ? 0 : root?.kind === 'argument' ? root.value + receiverOffset : -1;
+            if (index < 0 || index >= raw.length) throw new TypeError('invalid UniFFI object resource argument path');
+            raw[index] = rewriteResourceValue(raw[index], useSite.path.slice(1), (resource) => unwrapLease(resource, 'object', resourceTypeId(useSite)).handle);
+        }
+        return raw;
+    }
+
+    function wrapReturnResources(operation, result, scope) {
+        for (const useSite of operation.resourceUseSites) {
+            if (useSite.path[0]?.kind !== 'return') continue;
+            const typeId = resourceTypeId(useSite);
+            result = rewriteResourceValue(result, useSite.path.slice(1), (resource) => {
+                if (isLease(resource)) {
+                    unwrapLease(resource, 'object', typeId);
+                    return resource;
+                }
+                if (!Number.isInteger(resource) || resource < 0 || resource > 0xffffffff) throw new TypeError('invalid UniFFI object raw handle');
+                const lease = makeLease('object', typeId, resource, []);
+                scope.resources.push(lease);
+                return lease;
+            });
+        }
+        return result;
+    }
+
+    async function releaseScopeResources(scope) {
+        const resources = scope.resources.splice(0);
+        await Promise.allSettled(resources.map((lease) => releaseObjectState(objectLeases.get(lease.leaseId))));
+    }
+
+    async function releaseRawReturnResources(operation, result) {
+        const releases = [];
+        for (const useSite of operation.resourceUseSites) {
+            if (useSite.path[0]?.kind !== 'return') continue;
+            resourceTypeId(useSite);
+            try {
+                rewriteResourceValue(result, useSite.path.slice(1), (resource) => {
+                    if (isLease(resource)) {
+                        const state = objectLeases.get(resource.leaseId);
+                        if (state) releases.push(releaseObjectState(state));
+                    } else {
+                        const release = $RESOURCE_HOOKS$.releaseObject;
+                        if (typeof release !== 'function') throw new Error('missing UniFFI object release hook');
+                        const raw = release(resource);
+                        if (isThenable(raw)) releases.push(raw);
+                    }
+                    return resource;
+                });
+            } catch (error) {
+                releases.push(Promise.reject(error));
+            }
+        }
+        await Promise.allSettled(releases);
     }
 
     function registerCallback(typeId, callbackId, contract, scope) {
@@ -283,8 +396,8 @@ function $FACTORY$(host) {
     }
 
     function beginUseSites(operation, args) {
-        const receiverOffset = operation.receiverResource !== null ? 1 : 0;
-        const scope = { callbacks: [], newRetained: [], inputs: [] };
+        const receiverOffset = operation.hasReceiver ? 1 : 0;
+        const scope = { callbacks: [], newRetained: [], inputs: [], resources: [] };
         for (const useSite of operation.callbackUseSites) {
             if (useSite.path[0]?.kind !== 'argument') continue;
             for (const callbackId of valuesAtPath(args, undefined, useSite.path, receiverOffset)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
@@ -313,11 +426,17 @@ function $FACTORY$(host) {
     }
 
     function rawArguments(operation, args) {
-        const raw = args.slice();
-        if (operation.receiverResource?.kind === 'object') raw[0] = unwrapLease(args[0], 'object', operation.receiverResource.id).handle;
-        else if (operation.receiverResource?.kind === 'outputStream') raw[0] = unwrapLease(args[0], 'output', operation.receiverResource.id).handle;
-        else if (operation.receiverResource?.kind === 'inputStream') raw[0] = args[0]?.streamId ?? args[0];
+        const raw = rewriteArgumentResources(operation, args);
+        if (operation.kind === 'outputStreamNext' || operation.kind === 'outputStreamCancel') {
+            raw[0] = unwrapLease(args[0], 'output', operation.streamSlot.useSiteId).handle;
+        } else if (operation.kind === 'inputStreamPull' || operation.kind === 'inputStreamCancel') {
+            raw[0] = args[0]?.streamId ?? args[0];
+        }
         return raw;
+    }
+
+    function outputStartUseSite(operation) {
+        return operation.streamSlot?.kind === 'outputStreamStart' ? operation.streamSlot.useSiteId : null;
     }
 
     function makeLease(kind, typeId, handle, inputs) {
@@ -590,14 +709,19 @@ function $FACTORY$(host) {
     function finishSync(operation, args, scope, result, callGeneration) {
         try {
             if (detached || generation !== callGeneration) throw closedError();
-            if (operation.returnResource?.kind === 'object') result = makeLease('object', operation.returnResource.id, result, []);
-            if (operation.returnResource?.kind === 'outputStream') result = makeLease('output', operation.returnResource.id, result, scope.inputs);
+            result = wrapReturnResources(operation, result, scope);
+            const outputUseSiteId = outputStartUseSite(operation);
+            if (outputUseSiteId !== null) result = makeLease('output', outputUseSiteId, result, scope.inputs);
             for (const useSite of operation.callbackUseSites) {
                 if (useSite.path[0]?.kind !== 'return') continue;
                 for (const callbackId of valuesAtPath(args, result, useSite.path, 0)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
             }
-            if (operation.returnResource?.kind !== 'outputStream') for (const input of scope.inputs) track(cleanup, finishInput(input, false));
+            if (outputUseSiteId === null) for (const input of scope.inputs) track(cleanup, finishInput(input, false));
+            scope.resources.length = 0;
             return result;
+        } catch (error) {
+            track(cleanup, releaseScopeResources(scope));
+            throw error;
         } finally { releaseScopedCallbacks(scope.callbacks); }
     }
 
@@ -606,6 +730,7 @@ function $FACTORY$(host) {
             if (detached) {
                 if (operation.kind === 'outputStreamNext' || operation.kind === 'inputStreamPull') return { kind: 'done' };
                 if (operation.kind === 'outputStreamCancel' || operation.kind === 'inputStreamCancel') return undefined;
+                await releaseRawReturnResources(operation, result);
                 throw closedError();
             }
             if (operation.kind === 'outputStreamNext') {
@@ -620,34 +745,38 @@ function $FACTORY$(host) {
                 await finishOutputState(unwrapLease(args[0], 'output', operation.streamSlot.useSiteId));
                 return undefined;
             }
-            if (operation.returnResource?.kind === 'object') {
-                if (phase !== 'open' || detached || generation !== callGeneration) {
-                    await invokeReleaseSlot({ typeId: operation.returnResource.id, handle: result });
-                    throw closedError();
-                }
-                result = makeLease('object', operation.returnResource.id, result, []);
+            result = wrapReturnResources(operation, result, scope);
+            const hasReturnedObjects = operation.resourceUseSites.some((useSite) => useSite.path[0]?.kind === 'return');
+            if (detached || generation !== callGeneration || (phase !== 'open' && hasReturnedObjects)) {
+                await releaseScopeResources(scope);
+                throw closedError();
             }
-            if (operation.returnResource?.kind === 'outputStream') {
-                // A stream returned after close started has no consumer that
-                // could safely own its lease. Cancel/close it immediately
-                // rather than publishing a resource that close did not see.
+            const outputUseSiteId = outputStartUseSite(operation);
+            if (outputUseSiteId !== null) {
                 if (phase !== 'open' || detached || generation !== callGeneration) {
-                    const operationId = streamSlot(outputGroups.get(operation.returnResource.id), 'outputStreamCancel');
+                    const operationId = streamSlot(outputGroups.get(outputUseSiteId), 'outputStreamCancel');
                     try { await $TABLE$[operationId](result); }
                     finally {
                         if (typeof $RESOURCE_HOOKS$.closeOutputStream === 'function') await $RESOURCE_HOOKS$.closeOutputStream(result);
                     }
                     throw closedError();
                 }
-                result = makeLease('output', operation.returnResource.id, result, scope.inputs);
+                // A stream returned after close started has no consumer that
+                // could safely own its lease. Cancel/close it immediately
+                // rather than publishing a resource that close did not see.
+                result = makeLease('output', outputUseSiteId, result, scope.inputs);
             }
             for (const useSite of operation.callbackUseSites) {
                 if (useSite.path[0]?.kind !== 'return') continue;
                 for (const callbackId of valuesAtPath(args, result, useSite.path, 0)) registerCallback(useSite.callbackTypeId, callbackId, useSite.contract, scope);
             }
-            if (operation.returnResource?.kind !== 'outputStream') await Promise.allSettled(scope.inputs.map((input) => finishInput(input, false)));
+            if (outputUseSiteId === null) await Promise.allSettled(scope.inputs.map((input) => finishInput(input, false)));
             if (detached || generation !== callGeneration) throw closedError();
+            scope.resources.length = 0;
             return result;
+        } catch (error) {
+            await releaseScopeResources(scope);
+            throw error;
         } finally { releaseScopedCallbacks(scope.callbacks); }
     }
 
@@ -666,6 +795,7 @@ function $FACTORY$(host) {
             rollbackRetainedCallbacks(scope);
             releaseScopedCallbacks(scope.callbacks);
             for (const input of scope.inputs) track(cleanup, finishInput(input, true, error));
+            track(cleanup, releaseScopeResources(scope));
             throw error;
         }
     }
@@ -695,6 +825,7 @@ function $FACTORY$(host) {
                     try { await cancelOutputState(unwrapLease(args[0], 'output', operation.streamSlot.useSiteId), error); } catch {}
                 }
                 await Promise.allSettled(scope.inputs.map((input) => finishInput(input, true, error)));
+                await releaseScopeResources(scope);
                 if (detached) return undefined;
                 throw error;
             }

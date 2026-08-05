@@ -611,6 +611,13 @@ function $FACTORY$(host) {
         return new Error(`infallible UniFFI callback failed: ${message}`, { cause: error });
     }
 
+    function callbackResultEnvelope(result) {
+        if (result === null || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+            throw new TypeError('UniFFI callback result must be an { ok, value/error } envelope');
+        }
+        return result;
+    }
+
     function invokeCallbackSync(operation, args) {
         const [callbackId, ...methodArgs] = args;
         return invokeCallbackHostSync(operation, callbackId, methodArgs);
@@ -702,11 +709,9 @@ function $FACTORY$(host) {
             if (!operation || operation.asyncKind !== 'sync' || !operation.fallible) {
                 throw new Error(`unknown fallible sync UniFFI callback method ${callbackTypeId}:${methodId}`);
             }
-            try {
-                return { ok: true, value: invokeCallbackHostSync(operation, callbackId, args, callGeneration) };
-            } catch (error) {
-                return { ok: false, error };
-            }
+            const result = hostForGeneration(callGeneration).invokeCallbackSyncResult(callbackTypeId, callbackId, methodId, args);
+            if (isThenable(result)) throw new TypeError('sync UniFFI callback result returned a thenable');
+            return callbackResultEnvelope(result);
         },
         invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, args) {
             if (!Array.isArray(args)) return Promise.reject(new TypeError('UniFFI callback args must be an Array'));
@@ -714,10 +719,9 @@ function $FACTORY$(host) {
             if (!operation || operation.asyncKind !== 'async' || !operation.fallible) {
                 return Promise.reject(new Error(`unknown fallible async UniFFI callback method ${callbackTypeId}:${methodId}`));
             }
-            return Promise.resolve(invokeCallbackHostAsync(operation, callbackId, args, callGeneration, invocationId)).then(
-                (value) => ({ ok: true, value }),
-                (error) => ({ ok: false, error }),
-            );
+            const result = hostForGeneration(callGeneration).invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, args);
+            if (!isThenable(result)) return Promise.reject(new TypeError('async UniFFI callback result did not return a thenable'));
+            return Promise.resolve(result).then(callbackResultEnvelope);
         },
         pullInputStream(streamId) {
             return pullInputHost(streamId, callGeneration);
@@ -8695,6 +8699,7 @@ mod uniffi_surface_tests {
         assert!(cx.globals.contains("invokeAsync"));
         assert!(cx.globals.contains("invokeCallbackSyncResult"));
         assert!(cx.globals.contains("invokeCallbackAsyncResult"));
+        assert!(cx.globals.contains("callbackResultEnvelope"));
         assert!(cx
             .globals
             .contains("unknown fallible sync UniFFI callback method"));

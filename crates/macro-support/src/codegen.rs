@@ -1013,6 +1013,12 @@ impl TryToTokens for ast::Export {
                     all(target_family = "wasm", not(target_os = "wasi")),
                     export_name = #export_name,
                 )]
+                // UniFFI's programmatic engine descriptors intentionally use
+                // ABI carrier tuples and stable generated symbols.  Those
+                // are valid for wasm-bindgen's lowering but trigger the
+                // native Rust FFI/name lints when the generated host crate is
+                // compiled with `-D warnings`.
+                #[allow(improper_ctypes_definitions, non_snake_case)]
                 pub unsafe extern "C-unwind" fn #generated_name(#(#args),*) -> #wasm_bindgen::convert::WasmRet<#projection::Abi> {
                     const _: () = {
                         #(#checks)*

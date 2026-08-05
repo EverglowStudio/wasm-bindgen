@@ -620,7 +620,12 @@ function $FACTORY$(host) {
 
     function callbackState(dispatch, callbackId) {
         const state = callbacks.get(callbackKey(dispatch.callbackTypeId, callbackId));
-        if (!state) throw new Error(`unknown UniFFI callback ${dispatch.callbackTypeId}:${callbackId}`);
+        // Callback values returned from another callback are registered by
+        // the public runtime's CallbackRegistry, not by this engine call
+        // frame.  Keep the engine-local state optional in that case; the
+        // public host invocation below remains the source of truth for
+        // existence, retention and reentrancy of the returned callback.
+        if (!state) return null;
         if (state.forbidden && state.depth !== 0) throw new Error('forbidden UniFFI callback reentrancy');
         return state;
     }
@@ -645,14 +650,16 @@ function $FACTORY$(host) {
 
     function invokeCallbackHostSync(operation, callbackId, methodArgs, callGeneration = generation) {
         const state = callbackState(operation.callbackDispatch, callbackId);
-        state.depth += 1;
+        if (state) state.depth += 1;
         try {
             const result = hostForGeneration(callGeneration).invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, methodArgs);
             if (isThenable(result)) throw new TypeError('sync UniFFI callback returned a thenable');
             return rewriteCallbackReturnResources(operation, result);
         } catch (error) {
             throw callbackFailure(operation, error);
-        } finally { state.depth -= 1; }
+        } finally {
+            if (state) state.depth -= 1;
+        }
     }
 
     async function invokeCallbackAsync(operation, args) {
@@ -662,14 +669,16 @@ function $FACTORY$(host) {
 
     async function invokeCallbackHostAsync(operation, callbackId, methodArgs, callGeneration = generation, invocationId = nextInvocationId++) {
         const state = callbackState(operation.callbackDispatch, callbackId);
-        state.depth += 1;
+        if (state) state.depth += 1;
         try {
             const result = hostForGeneration(callGeneration).invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, invocationId, methodArgs);
             if (!isThenable(result)) throw new TypeError('async UniFFI callback did not return a thenable');
             return rewriteCallbackReturnResources(operation, await result);
         } catch (error) {
             throw callbackFailure(operation, error);
-        } finally { state.depth -= 1; }
+        } finally {
+            if (state) state.depth -= 1;
+        }
     }
 
     async function invokeInputHost(operation, args, callGeneration) {

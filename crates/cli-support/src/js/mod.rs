@@ -278,6 +278,26 @@ function $FACTORY$(host) {
         return raw;
     }
 
+    // Callback methods return values through the public JavaScript facade,
+    // whose object values are engine-owned leases (`{ surfaceId, leaseId,
+    // handle, ... }`).  The Rust callback proxy consumes the one canonical
+    // ABI representation: the registry's raw numeric object handle.  Apply
+    // the operation's declared return resource paths before handing a
+    // callback result back to Rust.  This mirrors argument rewriting, walks
+    // nested records/containers, and deliberately rejects anything other
+    // than an active lease (there is no numeric/object dual protocol).
+    function rewriteCallbackReturnResources(operation, result) {
+        for (const useSite of operation.resourceUseSites) {
+            if (useSite.path[0]?.kind !== 'return') continue;
+            const typeId = resourceTypeId(useSite);
+            result = rewriteResourceValue(result, useSite.path.slice(1), (resource) => {
+                if (!isLease(resource)) throw new TypeError('callback object return must be an engine lease');
+                return unwrapLease(resource, 'object', typeId).handle;
+            });
+        }
+        return result;
+    }
+
     function wrapReturnResources(operation, result, scope) {
         for (const useSite of operation.resourceUseSites) {
             if (useSite.path[0]?.kind !== 'return') continue;
@@ -629,7 +649,7 @@ function $FACTORY$(host) {
         try {
             const result = hostForGeneration(callGeneration).invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, methodArgs);
             if (isThenable(result)) throw new TypeError('sync UniFFI callback returned a thenable');
-            return result;
+            return rewriteCallbackReturnResources(operation, result);
         } catch (error) {
             throw callbackFailure(operation, error);
         } finally { state.depth -= 1; }
@@ -646,7 +666,7 @@ function $FACTORY$(host) {
         try {
             const result = hostForGeneration(callGeneration).invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, invocationId, methodArgs);
             if (!isThenable(result)) throw new TypeError('async UniFFI callback did not return a thenable');
-            return await result;
+            return rewriteCallbackReturnResources(operation, await result);
         } catch (error) {
             throw callbackFailure(operation, error);
         } finally { state.depth -= 1; }
@@ -711,7 +731,10 @@ function $FACTORY$(host) {
             }
             const result = hostForGeneration(callGeneration).invokeCallbackSyncResult(callbackTypeId, callbackId, methodId, args);
             if (isThenable(result)) throw new TypeError('sync UniFFI callback result returned a thenable');
-            return callbackResultEnvelope(result);
+            const envelope = callbackResultEnvelope(result);
+            return envelope.ok
+                ? { ...envelope, value: rewriteCallbackReturnResources(operation, envelope.value) }
+                : envelope;
         },
         invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, args) {
             if (!Array.isArray(args)) return Promise.reject(new TypeError('UniFFI callback args must be an Array'));
@@ -721,7 +744,12 @@ function $FACTORY$(host) {
             }
             const result = hostForGeneration(callGeneration).invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, args);
             if (!isThenable(result)) return Promise.reject(new TypeError('async UniFFI callback result did not return a thenable'));
-            return Promise.resolve(result).then(callbackResultEnvelope);
+            return Promise.resolve(result).then((value) => {
+                const envelope = callbackResultEnvelope(value);
+                return envelope.ok
+                    ? { ...envelope, value: rewriteCallbackReturnResources(operation, envelope.value) }
+                    : envelope;
+            });
         },
         pullInputStream(streamId) {
             return pullInputHost(streamId, callGeneration);
@@ -8700,6 +8728,10 @@ mod uniffi_surface_tests {
         assert!(cx.globals.contains("invokeCallbackSyncResult"));
         assert!(cx.globals.contains("invokeCallbackAsyncResult"));
         assert!(cx.globals.contains("callbackResultEnvelope"));
+        assert!(cx.globals.contains("rewriteCallbackReturnResources"));
+        assert!(cx
+            .globals
+            .contains("callback object return must be an engine lease"));
         assert!(cx
             .globals
             .contains("unknown fallible sync UniFFI callback method"));

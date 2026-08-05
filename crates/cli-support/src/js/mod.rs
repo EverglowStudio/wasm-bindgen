@@ -95,7 +95,7 @@ function $FACTORY$(host) {
     if (host === null || typeof host !== 'object') {
         throw new TypeError('UniFFI wasm backend factory requires a Host object');
     }
-    for (const method of ['invokeCallbackSync', 'invokeCallbackAsync', 'retainCallback', 'releaseCallback', 'pullInputStream', 'cancelInputStream', 'releaseInputStream']) {
+    for (const method of ['invokeCallbackSync', 'invokeCallbackAsync', 'invokeCallbackSyncResult', 'invokeCallbackAsyncResult', 'retainCallback', 'releaseCallback', 'pullInputStream', 'cancelInputStream', 'releaseInputStream']) {
         if (typeof host[method] !== 'function') throw new TypeError(`UniFFI Host is missing ${method}()`);
     }
 
@@ -633,11 +633,11 @@ function $FACTORY$(host) {
         return await invokeCallbackHostAsync(operation, callbackId, methodArgs);
     }
 
-    async function invokeCallbackHostAsync(operation, callbackId, methodArgs, callGeneration = generation) {
+    async function invokeCallbackHostAsync(operation, callbackId, methodArgs, callGeneration = generation, invocationId = nextInvocationId++) {
         const state = callbackState(operation.callbackDispatch, callbackId);
         state.depth += 1;
         try {
-            const result = hostForGeneration(callGeneration).invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, nextInvocationId++, methodArgs);
+            const result = hostForGeneration(callGeneration).invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, invocationId, methodArgs);
             if (!isThenable(result)) throw new TypeError('async UniFFI callback did not return a thenable');
             return await result;
         } catch (error) {
@@ -695,6 +695,29 @@ function $FACTORY$(host) {
             const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
             if (!operation || operation.asyncKind !== 'async') return Promise.reject(new Error(`unknown async UniFFI callback method ${callbackTypeId}:${methodId}`));
             return invokeCallbackHostAsync(operation, callbackId, args, callGeneration);
+        },
+        invokeCallbackSyncResult(callbackTypeId, callbackId, methodId, args) {
+            if (!Array.isArray(args)) throw new TypeError('UniFFI callback args must be an Array');
+            const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
+            if (!operation || operation.asyncKind !== 'sync' || !operation.fallible) {
+                throw new Error(`unknown fallible sync UniFFI callback method ${callbackTypeId}:${methodId}`);
+            }
+            try {
+                return { ok: true, value: invokeCallbackHostSync(operation, callbackId, args, callGeneration) };
+            } catch (error) {
+                return { ok: false, error };
+            }
+        },
+        invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, args) {
+            if (!Array.isArray(args)) return Promise.reject(new TypeError('UniFFI callback args must be an Array'));
+            const operation = callbackOperations.get(`${callbackTypeId}:${methodId}`);
+            if (!operation || operation.asyncKind !== 'async' || !operation.fallible) {
+                return Promise.reject(new Error(`unknown fallible async UniFFI callback method ${callbackTypeId}:${methodId}`));
+            }
+            return Promise.resolve(invokeCallbackHostAsync(operation, callbackId, args, callGeneration, invocationId)).then(
+                (value) => ({ ok: true, value }),
+                (error) => ({ ok: false, error }),
+            );
         },
         pullInputStream(streamId) {
             return pullInputHost(streamId, callGeneration);
@@ -8670,6 +8693,14 @@ mod uniffi_surface_tests {
             .contains("function __uniffi_backend_factory_impl(host)"));
         assert!(cx.globals.contains("invokeSync"));
         assert!(cx.globals.contains("invokeAsync"));
+        assert!(cx.globals.contains("invokeCallbackSyncResult"));
+        assert!(cx.globals.contains("invokeCallbackAsyncResult"));
+        assert!(cx
+            .globals
+            .contains("unknown fallible sync UniFFI callback method"));
+        assert!(cx
+            .globals
+            .contains("unknown fallible async UniFFI callback method"));
         assert!(!cx.globals.contains("call(operationId"));
         assert_eq!(cx.export_name_list, ["__uniffi_backend_factory"]);
         assert!(!cx.typescript.contains("__uniffi_op_0"));

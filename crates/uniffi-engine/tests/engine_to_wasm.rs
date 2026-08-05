@@ -1365,7 +1365,28 @@ const host = {{
     releaseInputStream(streamId) {{ inputReleased.push(streamId); }},
 }};
 
-session = api.{DEFAULT_BACKEND_FACTORY}(host);
+function makeSession(host) {{
+    const backend = api.{DEFAULT_BACKEND_FACTORY}(host);
+    const unwrap = (raw) => {{
+        assert.equal(raw?.kind, 'value');
+        return raw.value;
+    }};
+    return Object.freeze({{
+        info: backend.info,
+        invokeSync(...args) {{ return unwrap(backend.invokeSync(...args)); }},
+        invokeAsync(...args) {{
+            const call = backend.invokeAsync(...args).then(unwrap);
+            call.catch(() => {{}});
+            return call;
+        }},
+        cancelOutputStream(...args) {{ return backend.cancelOutputStream(...args); }},
+        close(...args) {{ return backend.close(...args); }},
+        releaseObject(...args) {{ return backend.releaseObject(...args); }},
+        releaseOutputStream(...args) {{ return backend.releaseOutputStream(...args); }},
+    }});
+}}
+
+session = makeSession(host);
 assert.deepEqual(Object.keys(session).sort(), ['cancelOutputStream', 'close', 'info', 'invokeAsync', 'invokeSync', 'releaseObject', 'releaseOutputStream'].sort());
 assert.equal(session.info.operationCount, 35);
 assert.equal(session.invokeSync(0, ['sum', new Uint8Array([1, 2, 3, 4])]), 'sum:10');
@@ -1451,7 +1472,7 @@ assert.deepEqual(released, [[7, 99], [7, 41], [7, 42]]);
 assert.deepEqual(inputReleased.sort((a, b) => a - b), [55, 56, 57, 60, 61, 62, 63, 64, 70]);
 assert.deepEqual(inputCancelled.sort((a, b) => a - b), [56, 61, 63]);
 
-const inspector = api.{DEFAULT_BACKEND_FACTORY}(host);
+const inspector = makeSession(host);
 assert.equal(inspector.invokeSync(15, []), '3,2,6');
 assert.equal(inspector.invokeSync(4, [41]), 41);
 assert.equal(await inspector.invokeAsync(7, [41, 'next-session']), 'async-2:next-session');
@@ -1460,7 +1481,7 @@ await inspector.close();
 
 // Nested object resource paths use the same backend walker for records,
 // optional values, sequences, maps (both keys and values), and sets.
-const nestedSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const nestedSession = makeSession(host);
 const recordLease = nestedSession.invokeSync(14, [710]);
 const recordResult = nestedSession.invokeSync(26, [{{ object: recordLease }}]);
 assert.equal(recordResult.object.handle, 710);
@@ -1508,7 +1529,7 @@ nestedSession.releaseObject(matchingVariantLease);
 await nestedSession.close();
 let releaseNestedGate;
 globalThis.__uniffi_test_gate = new Promise((resolve) => {{ releaseNestedGate = resolve; }});
-const lateNestedSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const lateNestedSession = makeSession(host);
 const lateNestedArgument = lateNestedSession.invokeSync(14, [719]);
 const lateNested = lateNestedSession.invokeAsync(33, [{{ object: lateNestedArgument }}]);
 const lateNestedClose = lateNestedSession.close();
@@ -1516,14 +1537,14 @@ setTimeout(() => releaseNestedGate(), 5);
 await assert.rejects(lateNested, /closed/);
 await lateNestedClose;
 delete globalThis.__uniffi_test_gate;
-const releaseInspector = api.{DEFAULT_BACKEND_FACTORY}(host);
+const releaseInspector = makeSession(host);
 assert.equal(releaseInspector.invokeSync(34, [900]), 1);
 assert.equal(releaseInspector.invokeSync(34, [719]), 1);
 await releaseInspector.close();
 
 // Reentrant close from a synchronous callback keeps the in-flight invocation
 // on its original generation; only the next call is rejected.
-reentrantSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+reentrantSession = makeSession(host);
 assert.equal(reentrantSession.invokeSync(4, [41]), 41);
 assert.equal(reentrantSession.invokeSync(5, [41, 'close']), 'sync-0:close');
 await reentrantSession.close();
@@ -1533,7 +1554,7 @@ await reentrantSession.close();
 // call callback and input hooks after close starts but before the deadline.
 let releaseGate;
 globalThis.__uniffi_test_gate = new Promise((resolve) => {{ releaseGate = resolve; }});
-const delayedSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const delayedSession = makeSession(host);
 assert.equal(delayedSession.invokeSync(4, [44]), 44);
 const delayedCallback = delayedSession.invokeAsync(18, [44]);
 const delayedInput = delayedSession.invokeAsync(20, [94]);
@@ -1559,7 +1580,7 @@ globalThis.clearTimeout = (timer) => {{
     clearedTimers += 1;
     return savedClearTimeout(timer);
 }};
-const naturalSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const naturalSession = makeSession(host);
 await naturalSession.close();
 globalThis.setTimeout = savedSetTimeout;
 globalThis.clearTimeout = savedClearTimeout;
@@ -1570,7 +1591,7 @@ assert.equal(clearedTimers, 1);
 // backend cleanup promises never settle.  The late callback promise is kept
 // intentionally unresolved; close must still resolve and no later callback or
 // release may enter the Host.
-const deadlineSession = api.{DEFAULT_BACKEND_FACTORY}(host);
+const deadlineSession = makeSession(host);
 assert.equal(deadlineSession.invokeSync(4, [41]), 41);
 const stuckCallback = deadlineSession.invokeAsync(7, [41, 'never']);
 const stuckInput = deadlineSession.invokeAsync(20, [91]);

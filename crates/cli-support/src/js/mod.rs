@@ -727,7 +727,11 @@ function $FACTORY$(host) {
             }
             if (outputUseSiteId === null) for (const input of scope.inputs) track(cleanup, finishInput(input, false));
             scope.resources.length = 0;
-            return result;
+            // Every backend call uses one envelope protocol.  Stream values
+            // are still ordinary successful values; the stream-step tag is
+            // nested under `value` so it cannot be confused with the
+            // call-level error envelope.
+            return { kind: 'value', value: result };
         } catch (error) {
             track(cleanup, releaseScopeResources(scope));
             throw error;
@@ -737,8 +741,8 @@ function $FACTORY$(host) {
     async function finishAsync(operation, args, scope, result, callGeneration) {
         try {
             if (detached) {
-                if (operation.kind === 'outputStreamNext' || operation.kind === 'inputStreamPull') return { kind: 'done' };
-                if (operation.kind === 'outputStreamCancel' || operation.kind === 'inputStreamCancel') return undefined;
+                if (operation.kind === 'outputStreamNext' || operation.kind === 'inputStreamPull') return { kind: 'value', value: { kind: 'done' } };
+                if (operation.kind === 'outputStreamCancel' || operation.kind === 'inputStreamCancel') return { kind: 'value', value: undefined };
                 await releaseRawReturnResources(operation, result);
                 throw closedError();
             }
@@ -747,16 +751,16 @@ function $FACTORY$(host) {
                 const state = unwrapLease(args[0], 'output', operation.streamSlot.useSiteId);
                 if (state.cancelStarted || state.closeStarted) {
                     await releaseRawReturnResources(operation, result);
-                    return { kind: 'done' };
+                    return { kind: 'value', value: { kind: 'done' } };
                 }
                 result = wrapReturnResources(operation, result, scope);
                 const step = validateStreamStep(result);
                 if (step.kind !== 'item') await finishOutputState(state);
-                return step;
+                return { kind: 'value', value: step };
             }
             if (operation.kind === 'outputStreamCancel') {
                 await finishOutputState(unwrapLease(args[0], 'output', operation.streamSlot.useSiteId));
-                return undefined;
+                return { kind: 'value', value: undefined };
             }
             result = wrapReturnResources(operation, result, scope);
             const hasReturnedObjects = operation.resourceUseSites.some((useSite) => useSite.path[0]?.kind === 'return');
@@ -786,7 +790,7 @@ function $FACTORY$(host) {
             if (outputUseSiteId === null) await Promise.allSettled(scope.inputs.map((input) => finishInput(input, false)));
             if (detached || generation !== callGeneration) throw closedError();
             scope.resources.length = 0;
-            return result;
+            return { kind: 'value', value: result };
         } catch (error) {
             await releaseScopeResources(scope);
             throw error;
@@ -798,7 +802,7 @@ function $FACTORY$(host) {
         const operation = descriptor(operationId);
         if (operation.asyncKind !== 'sync') throw new TypeError(`UniFFI operation ${operationId} is asynchronous`);
         validateArgs(operation, args);
-        if (operation.callbackDispatch !== null) return invokeCallbackSync(operation, args);
+        if (operation.callbackDispatch !== null) return { kind: 'value', value: invokeCallbackSync(operation, args) };
         const scope = beginUseSites(operation, args);
         try {
             const result = invokeRaw(operation, args, generation);

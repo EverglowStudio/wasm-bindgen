@@ -278,6 +278,49 @@ function $FACTORY$(host) {
         return raw;
     }
 
+    function wrapCallbackArgumentResources(operation, args, scope) {
+        const wrapped = args.slice();
+        for (const useSite of operation.resourceUseSites) {
+            const root = useSite.path[0];
+            if (root?.kind === 'return') continue;
+            if (root?.kind !== 'argument' || root.value < 0 || root.value >= wrapped.length) throw new TypeError('invalid UniFFI callback object argument path');
+            const typeId = resourceTypeId(useSite);
+            wrapped[root.value] = rewriteResourceValue(wrapped[root.value], useSite.path.slice(1), (resource) => {
+                // Public host-dispatched calls already carry session leases.
+                if (isLease(resource)) {
+                    unwrapLease(resource, 'object', typeId);
+                    return resource;
+                }
+                if (!Number.isInteger(resource) || resource < 0 || resource > 0xffffffff) throw new TypeError('invalid UniFFI object raw handle');
+                // Even a borrowed callback argument has a fresh registry
+                // entry holding its Rust Arc until the public object disposes.
+                const lease = makeLease('object', typeId, resource, []);
+                scope.resources.push(lease);
+                return lease;
+            });
+        }
+        return wrapped;
+    }
+
+    function invokeCallbackWithResources(operation, args, callGeneration, invoke) {
+        const scope = { resources: [] };
+        try {
+            const callbackHost = hostForGeneration(callGeneration);
+            const wrapped = wrapCallbackArgumentResources(operation, args, scope);
+            const result = invoke(callbackHost, wrapped);
+            // The Host now owns delivery, including an asynchronous callback
+            // or a declared error envelope. Keep these leases until explicit
+            // disposal/session close, never until callback settlement.
+            scope.resources.length = 0;
+            return result;
+        } catch (error) {
+            // Roll back only leases created by this dispatch, not pre-existing
+            // public leases. Cleanup participates in the session close budget.
+            track(cleanup, releaseScopeResources(scope));
+            throw error;
+        }
+    }
+
     // Callback methods return values through the public JavaScript facade,
     // whose object values are engine-owned leases (`{ surfaceId, leaseId,
     // handle, ... }`).  The Rust callback proxy consumes the one canonical
@@ -652,7 +695,8 @@ function $FACTORY$(host) {
         const state = callbackState(operation.callbackDispatch, callbackId);
         if (state) state.depth += 1;
         try {
-            const result = hostForGeneration(callGeneration).invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, methodArgs);
+            const result = invokeCallbackWithResources(operation, methodArgs, callGeneration, (callbackHost, wrapped) =>
+                callbackHost.invokeCallbackSync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, wrapped));
             if (isThenable(result)) throw new TypeError('sync UniFFI callback returned a thenable');
             return rewriteCallbackReturnResources(operation, result);
         } catch (error) {
@@ -671,7 +715,8 @@ function $FACTORY$(host) {
         const state = callbackState(operation.callbackDispatch, callbackId);
         if (state) state.depth += 1;
         try {
-            const result = hostForGeneration(callGeneration).invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, invocationId, methodArgs);
+            const result = invokeCallbackWithResources(operation, methodArgs, callGeneration, (callbackHost, wrapped) =>
+                callbackHost.invokeCallbackAsync(operation.callbackDispatch.callbackTypeId, callbackId, operation.callbackDispatch.methodId, invocationId, wrapped));
             if (!isThenable(result)) throw new TypeError('async UniFFI callback did not return a thenable');
             return rewriteCallbackReturnResources(operation, await result);
         } catch (error) {
@@ -738,7 +783,8 @@ function $FACTORY$(host) {
             if (!operation || operation.asyncKind !== 'sync' || !operation.fallible) {
                 throw new Error(`unknown fallible sync UniFFI callback method ${callbackTypeId}:${methodId}`);
             }
-            const result = hostForGeneration(callGeneration).invokeCallbackSyncResult(callbackTypeId, callbackId, methodId, args);
+            const result = invokeCallbackWithResources(operation, args, callGeneration, (callbackHost, wrapped) =>
+                callbackHost.invokeCallbackSyncResult(callbackTypeId, callbackId, methodId, wrapped));
             if (isThenable(result)) throw new TypeError('sync UniFFI callback result returned a thenable');
             const envelope = callbackResultEnvelope(result);
             return envelope.ok
@@ -751,7 +797,8 @@ function $FACTORY$(host) {
             if (!operation || operation.asyncKind !== 'async' || !operation.fallible) {
                 return Promise.reject(new Error(`unknown fallible async UniFFI callback method ${callbackTypeId}:${methodId}`));
             }
-            const result = hostForGeneration(callGeneration).invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, args);
+            const result = invokeCallbackWithResources(operation, args, callGeneration, (callbackHost, wrapped) =>
+                callbackHost.invokeCallbackAsyncResult(callbackTypeId, callbackId, methodId, invocationId, wrapped));
             if (!isThenable(result)) return Promise.reject(new TypeError('async UniFFI callback result did not return a thenable'));
             return Promise.resolve(result).then((value) => {
                 const envelope = callbackResultEnvelope(value);
@@ -941,6 +988,10 @@ function $FACTORY$(host) {
             for (const state of Array.from(inputStreams.values())) track(cleanup, finishInput(state, true));
             while (pending.size !== 0 || cleanup.size !== 0) {
                 await Promise.allSettled([...pending, ...cleanup]);
+                // In-flight Rust calls may deliver callback arguments after
+                // the initial sweep. Reclaim those leases once the calls
+                // settle, under the same close deadline as every other hook.
+                for (const state of Array.from(objectLeases.values())) track(cleanup, releaseObjectState(state));
             }
             return 'natural';
         })();
@@ -8669,6 +8720,9 @@ fn write_es_import(dest: &mut String, module: &str, items: &[(String, Option<Str
     dest.push_str(module);
     dest.push_str("';\n");
 }
+
+#[cfg(test)]
+mod uniffi_callback_resource_tests;
 
 #[cfg(test)]
 mod uniffi_surface_tests {

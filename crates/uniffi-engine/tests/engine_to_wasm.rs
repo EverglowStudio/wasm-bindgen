@@ -933,6 +933,64 @@ fn engine_plan() -> WasmEnginePlan {
         None,
     ));
 
+    let mut callback_object = operation(
+        35,
+        "aj_callback_object",
+        vec![scalar_binding(
+            "callback_id",
+            WasmScalarType::U32,
+            WasmCarrier::U32,
+        )],
+        Some(scalar_return(WasmScalarType::U32, WasmCarrier::U32)),
+        WasmAsyncKind::Async,
+        Some(0),
+    );
+    callback_object
+        .callback_use_sites
+        .push(WasmCallbackUseSite {
+            operation_id: 35,
+            callback_type_id: 7,
+            path: WasmValuePath::argument(0),
+            contract: WasmCallbackContract {
+                retention: WasmCallbackRetention::Retained,
+                threading: WasmCallbackThreading::CallingThread,
+                reentrancy: WasmCallbackReentrancy::Forbidden,
+            },
+        });
+    operations.push(callback_object);
+    let mut object_callback = operation(
+        36,
+        "ak_object_callback",
+        vec![
+            scalar_binding("offset", WasmScalarType::U32, WasmCarrier::U32),
+            scalar_binding("length", WasmScalarType::U32, WasmCarrier::U32),
+            scalar_binding("object", WasmScalarType::U32, WasmCarrier::OpaqueHandle),
+        ],
+        Some(scalar_return(WasmScalarType::U32, WasmCarrier::U32)),
+        WasmAsyncKind::Async,
+        Some(0),
+    );
+    object_callback.kind = WasmOperationKind::CallbackMethod;
+    object_callback.source_key.kind = WasmOperationKind::CallbackMethod;
+    object_callback.callback_method_id = Some(4);
+    object_callback.call_target = WasmCallTarget::CallbackMethod {
+        callback: RustPath::new(["fixture".to_owned(), "Observer".to_owned()]).unwrap(),
+        callback_type_id: 7,
+        method_id: 4,
+        item: "ak_object_callback".to_owned(),
+    };
+    object_callback.arguments[2].carrier = WasmRustCarrier::OpaqueHandle;
+    object_callback.arguments[2].ownership = WasmOwnership::Borrowed;
+    object_callback.arguments[2].conversion = WasmConversionRecipe::Object(42);
+    object_callback
+        .resource_use_sites
+        .push(WasmResourceUseSite::object(
+            WasmValuePath::argument(2),
+            42,
+            WasmOwnership::Borrowed,
+        ));
+    operations.push(object_callback);
+
     WasmEnginePlan::build_with_resource_hooks(
         wasm_bindgen_uniffi_engine::ClosePolicy {
             // Real conformance uses a short policy so a deliberately stuck
@@ -1000,6 +1058,7 @@ mod fixture {{
     struct State {{
         release: u32,
         released_handles: BTreeMap<u32, u32>,
+        next_callback_handle: u32,
         cancel: u32,
         close: u32,
         pulls: BTreeMap<u32, u32>,
@@ -1214,6 +1273,34 @@ mod fixture {{
         STATE.with(|state| state.borrow().released_handles.get(&handle).copied().unwrap_or(0))
     }}
 
+    pub async fn aj_callback_object(host: JsValue, callback_id: u32) -> Result<u32, JsValue> {{
+        let handle = STATE.with(|state| {{
+            let mut state = state.borrow_mut();
+            state.next_callback_handle += 1;
+            10_000 + state.next_callback_handle
+        }});
+        let args = Array::new();
+        args.push(&JsValue::from_f64(17.0));
+        args.push(&JsValue::from_f64(23.0));
+        // Match a real callback proxy: the fresh opaque Rust handle crosses
+        // the ABI as a number, even though its use-site is borrowed.
+        args.push(&JsValue::from_f64(handle as f64));
+        let invocation = Array::new();
+        invocation.push(&JsValue::from_f64(7.0));
+        invocation.push(&JsValue::from_f64(callback_id as f64));
+        invocation.push(&JsValue::from_f64(4.0));
+        invocation.push(&JsValue::from_f64(77.0));
+        invocation.push(&args);
+        let promise: Promise = host_method(&host, "invokeCallbackAsyncResult")
+            .apply(&host, &invocation)?
+            .dyn_into()?;
+        let envelope = JsFuture::from(promise).await?;
+        if Reflect::get(&envelope, &JsValue::from_str("ok"))?.as_bool() != Some(true) {{
+            return Err(Reflect::get(&envelope, &JsValue::from_str("error"))?);
+        }}
+        Ok(handle)
+    }}
+
     pub async fn close_output_stream(handle: u32) {{
         if handle == 1093 {{
             std::future::pending::<()>().await;
@@ -1290,7 +1377,23 @@ fn assert_command_success(label: &str, output: &Output) {
     );
 }
 
-fn runtime_script(module_name: &str, web: bool) -> String {
+fn runtime_script(plan: &WasmEnginePlan, module_name: &str, web: bool) -> String {
+    let callback_arguments = plan
+        .operation_plans()
+        .flat_map(|operation| {
+            operation.callback_use_sites.iter().map(move |use_site| {
+                let Some(WasmValuePathSegment::Argument(index)) = use_site.path.segments().first()
+                else {
+                    panic!("fixture callback registration requires an argument use-site");
+                };
+                format!(
+                    "[{}, {}, {}]",
+                    operation.operation_id, use_site.callback_type_id, index
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let imports = if web {
         format!(
             "import init, * as api from './{module_name}.js';\n\
@@ -1306,7 +1409,7 @@ import assert from 'node:assert/strict';
 {imports}
 
 for (const raw of [
-    ...Array.from({{ length: 35 }}, (_, index) => `__uniffi_operation_${{index}}`),
+    ...Array.from({{ length: 37 }}, (_, index) => `__uniffi_operation_${{index}}`),
     '__uniffi_release_object',
     '__uniffi_close_output_stream',
 ]) {{
@@ -1324,6 +1427,7 @@ const callbackInvocations = [];
 const inputPulls = new Map();
 const inputCancelled = [];
 const inputReleased = [];
+const callbackArgumentUseSites = [{callback_arguments}];
 let session;
 let reentrantSession;
 const host = {{
@@ -1348,6 +1452,14 @@ const host = {{
         if (methodId === 3 && args[0] === 'reject') throw new Error('async callback declared error');
         return `async-${{methodId}}:${{args[0]}}`;
     }},
+    invokeCallbackSyncResult(...args) {{
+        try {{ return {{ ok: true, value: this.invokeCallbackSync(...args) }}; }}
+        catch (error) {{ return {{ ok: false, error }}; }}
+    }},
+    async invokeCallbackAsyncResult(...args) {{
+        try {{ return {{ ok: true, value: await this.invokeCallbackAsync(...args) }}; }}
+        catch (error) {{ return {{ ok: false, error }}; }}
+    }},
     retainCallback(typeId, callbackId) {{ retained.push([typeId, callbackId]); }},
     releaseCallback(typeId, callbackId) {{ released.push([typeId, callbackId]); }},
     async pullInputStream(streamId) {{
@@ -1366,21 +1478,107 @@ const host = {{
 }};
 
 function makeSession(host) {{
-    const backend = api.{DEFAULT_BACKEND_FACTORY}(host);
+    // The fixture passes numeric IDs directly. Model the public facade's
+    // argument registration/frame release separately from engine Host leases.
+    // Callback existence belongs to this session's Host registry, including
+    // after the engine's scoped callback state has already been removed.
+    const callbacks = new Map();
+    const cleanupCallback = (entry) => {{
+        if (entry.frames === 0 && entry.hostLeases === 0 && entry.active === 0) callbacks.delete(entry.key);
+    }};
+    const requireCallback = (typeId, callbackId) => {{
+        const entry = callbacks.get(`${{typeId}}:${{callbackId}}`);
+        if (!entry) throw new Error(`unknown UniFFI callback ${{typeId}}:${{callbackId}}`);
+        return entry;
+    }};
+    const beginCallbackFrame = (operationId, args) => {{
+        const entries = [];
+        for (const [operation, typeId, index] of callbackArgumentUseSites) {{
+            if (operation !== operationId || args[index] == null) continue;
+            const key = `${{typeId}}:${{args[index]}}`;
+            let entry = callbacks.get(key);
+            if (!entry) {{
+                entry = {{ key, frames: 0, hostLeases: 0, active: 0 }};
+                callbacks.set(key, entry);
+            }}
+            entry.frames += 1;
+            entries.push(entry);
+        }}
+        return entries;
+    }};
+    const finishCallbackFrame = (entries) => {{
+        for (const entry of entries) {{ entry.frames -= 1; cleanupCallback(entry); }}
+    }};
+    const sessionHost = {{
+        ...host,
+        retainCallback(typeId, callbackId) {{
+            requireCallback(typeId, callbackId).hostLeases += 1;
+            return host.retainCallback(typeId, callbackId);
+        }},
+        releaseCallback(typeId, callbackId) {{
+            const entry = callbacks.get(`${{typeId}}:${{callbackId}}`);
+            if (entry) {{
+                assert.ok(entry.hostLeases > 0);
+                entry.hostLeases -= 1;
+                cleanupCallback(entry);
+            }}
+            return host.releaseCallback(typeId, callbackId);
+        }},
+    }};
+    for (const name of ['invokeCallbackSync', 'invokeCallbackSyncResult']) {{
+        sessionHost[name] = function(typeId, callbackId, ...args) {{
+            const entry = requireCallback(typeId, callbackId);
+            entry.active += 1;
+            try {{ return host[name].call(sessionHost, typeId, callbackId, ...args); }}
+            finally {{ entry.active -= 1; cleanupCallback(entry); }}
+        }};
+    }}
+    for (const name of ['invokeCallbackAsync', 'invokeCallbackAsyncResult']) {{
+        sessionHost[name] = function(typeId, callbackId, ...args) {{
+            let entry;
+            try {{ entry = requireCallback(typeId, callbackId); }}
+            catch (error) {{ return Promise.reject(error); }}
+            entry.active += 1;
+            const finish = () => {{ entry.active -= 1; cleanupCallback(entry); }};
+            try {{
+                const result = host[name].call(sessionHost, typeId, callbackId, ...args);
+                // Observe settlement without changing the Host promise or its
+                // scheduling, which the engine's reentrancy checks also see.
+                Promise.resolve(result).then(finish, finish);
+                return result;
+            }} catch (error) {{
+                finish();
+                return Promise.reject(error);
+            }}
+        }};
+    }}
+    const backend = api.{DEFAULT_BACKEND_FACTORY}(sessionHost);
     const unwrap = (raw) => {{
         assert.equal(raw?.kind, 'value');
         return raw.value;
     }};
     return Object.freeze({{
         info: backend.info,
-        invokeSync(...args) {{ return unwrap(backend.invokeSync(...args)); }},
-        invokeAsync(...args) {{
-            const call = backend.invokeAsync(...args).then(unwrap);
+        invokeSync(operationId, args) {{
+            const frame = beginCallbackFrame(operationId, args);
+            try {{ return unwrap(backend.invokeSync(operationId, args)); }}
+            finally {{ finishCallbackFrame(frame); }}
+        }},
+        invokeAsync(operationId, args) {{
+            const frame = beginCallbackFrame(operationId, args);
+            const call = (async () => {{
+                try {{ return unwrap(await backend.invokeAsync(operationId, args)); }}
+                finally {{ finishCallbackFrame(frame); }}
+            }})();
             call.catch(() => {{}});
             return call;
         }},
         cancelOutputStream(...args) {{ return backend.cancelOutputStream(...args); }},
-        close(...args) {{ return backend.close(...args); }},
+        close(...args) {{
+            const result = backend.close(...args);
+            result.then(() => callbacks.clear(), () => callbacks.clear());
+            return result;
+        }},
         releaseObject(...args) {{ return backend.releaseObject(...args); }},
         releaseOutputStream(...args) {{ return backend.releaseOutputStream(...args); }},
     }});
@@ -1388,7 +1586,7 @@ function makeSession(host) {{
 
 session = makeSession(host);
 assert.deepEqual(Object.keys(session).sort(), ['cancelOutputStream', 'close', 'info', 'invokeAsync', 'invokeSync', 'releaseObject', 'releaseOutputStream'].sort());
-assert.equal(session.info.operationCount, 35);
+assert.equal(session.info.operationCount, 37);
 assert.equal(session.invokeSync(0, ['sum', new Uint8Array([1, 2, 3, 4])]), 'sum:10');
 const pending = session.invokeAsync(1, ['bytes']);
 assert.equal(typeof pending.then, 'function');
@@ -1617,6 +1815,41 @@ assert.equal(await remainsPending(stuckInput), true);
 assert.equal(await remainsPending(stuckNext), true);
 assert.equal(await remainsPending(stuckCancel), true);
 assert.equal(await remainsPending(stuckObject), true);
+
+// A real Rust callback issues a fresh numeric object handle. The production
+// EngineHost must turn it into a lease usable by a second Rust method, retain
+// it after callback settlement, and invoke the Rust release hook only once.
+const callbackObjects = [];
+let objectCallbackSession;
+const objectCallbackHost = {{
+    ...host,
+    async invokeCallbackAsyncResult(typeId, callbackId, methodId, invocationId, args) {{
+        assert.deepEqual([typeId, callbackId, methodId, invocationId], [7, 45, 4, 77]);
+        const [offset, length, lease] = args;
+        assert.deepEqual([offset, length], [17, 23]);
+        assert.equal(lease.typeId, 42);
+        assert.equal(objectCallbackSession.invokeSync(31, [lease, offset]), lease.handle + offset);
+        callbackObjects.push(lease);
+        return {{ ok: true, value: length }};
+    }},
+}};
+objectCallbackSession = makeSession(objectCallbackHost);
+const disposedHandle = await objectCallbackSession.invokeAsync(35, [45]);
+assert.equal(callbackObjects[0].handle, disposedHandle);
+assert.equal(objectCallbackSession.invokeSync(34, [disposedHandle]), 0);
+assert.equal(objectCallbackSession.invokeSync(31, [callbackObjects[0], 1]), disposedHandle + 1);
+objectCallbackSession.releaseObject(callbackObjects[0]);
+objectCallbackSession.releaseObject(callbackObjects[0]);
+assert.throws(() => objectCallbackSession.invokeSync(31, [callbackObjects[0], 1]), /resource lease/);
+const closedHandle = await objectCallbackSession.invokeAsync(35, [45]);
+assert.notEqual(closedHandle, disposedHandle);
+assert.equal(objectCallbackSession.invokeSync(34, [closedHandle]), 0);
+await objectCallbackSession.close();
+const callbackInspector = makeSession(host);
+assert.equal(callbackInspector.invokeSync(34, [disposedHandle]), 1);
+assert.equal(callbackInspector.invokeSync(34, [closedHandle]), 1);
+await callbackInspector.close();
+assert.equal(released.filter(([typeId, callbackId]) => typeId === 7 && callbackId === 45).length, 1);
 void closeOutput;
 "#
     )
@@ -1654,7 +1887,7 @@ fn generate_and_run_target(
     fs::write(output_dir.join("package.json"), module_type).unwrap();
     fs::write(
         output_dir.join("run.mjs"),
-        runtime_script(&module_name, target == PostLinkTarget::Web),
+        runtime_script(plan, &module_name, target == PostLinkTarget::Web),
     )
     .unwrap();
     let mut command = Command::new(node);

@@ -1613,13 +1613,31 @@ pub struct PostLinkPlan {
 }
 
 impl PostLinkPlan {
+    /// Expose selected raw wasm-bindgen platform definitions alongside the
+    /// private backend factory, with their standard TypeScript declarations.
+    ///
+    /// Names are top-level JavaScript export names, not Wasm ABI symbols.
+    /// Replaces the current selection; an empty set retains the factory-only
+    /// surface and disables TypeScript output. Backend-name collisions fail
+    /// here; missing, private or unsupported definitions fail in [`Self::run`].
+    pub fn with_platform_exports(
+        mut self,
+        exports: impl IntoIterator<Item = String>,
+    ) -> Result<Self, EngineError> {
+        self.backend = self
+            .backend
+            .with_platform_exports(exports)
+            .map_err(|error| EngineError::Surface(error.to_string()))?;
+        Ok(self)
+    }
+
     /// Run wasm-bindgen in process and return an engine-owned output.
     pub fn run(&self) -> Result<PostLinkOutput, EngineError> {
         let mut bindgen = Bindgen::new();
         bindgen
             .input_path(&self.wasm_path)
             .out_name(&self.module_name)
-            .typescript(false)
+            .typescript(!self.backend.platform_exports().is_empty())
             .binding_surface(BindingSurface::UniFfiBackend(self.backend.clone()));
         match self.target {
             PostLinkTarget::Web => bindgen
@@ -1942,6 +1960,31 @@ mod tests {
         let duplicate =
             WasmEnginePlan::build(policy(), vec![operation(0), operation(0)]).unwrap_err();
         assert_eq!(duplicate, EngineError::DuplicateOperation(0));
+    }
+
+    #[test]
+    fn platform_exports_are_validated_without_reading_the_wasm_file() {
+        let plan = WasmEnginePlan::build(policy(), vec![operation(0)]).unwrap();
+        let post_link = plan.post_link("not-yet-built.wasm", "fixture", PostLinkTarget::Web);
+        for name in [DEFAULT_BACKEND_FACTORY, "__uniffi_operation_0", "bad.name"] {
+            assert!(matches!(
+                post_link.clone().with_platform_exports([name.to_owned()]),
+                Err(EngineError::Surface(_))
+            ));
+        }
+        let selected = post_link
+            .with_platform_exports(["PlatformCounter".to_owned()])
+            .unwrap();
+        assert!(selected
+            .backend
+            .platform_exports()
+            .contains("PlatformCounter"));
+        assert!(selected
+            .with_platform_exports([])
+            .unwrap()
+            .backend
+            .platform_exports()
+            .is_empty());
     }
 
     #[test]

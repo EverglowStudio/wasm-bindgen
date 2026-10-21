@@ -1752,7 +1752,12 @@ impl<'a> Context<'a> {
             self.js_import_header()?;
         }
 
-        if !self.exports.is_empty() {
+        if !self.exports.is_empty()
+            || matches!(
+                self.config.selected_binding_surface(),
+                BindingSurface::UniFfiBackend(_)
+            )
+        {
             // Write out all exports
             region!(self, "exports", {
                 self.write_exports()?;
@@ -1933,6 +1938,17 @@ impl<'a> Context<'a> {
             ts.push_str("export { BindgenModule };\n");
         } else {
             ts.push_str(&self.typescript);
+            if self.config.typescript_enabled()
+                && matches!(
+                    self.config.selected_binding_surface(),
+                    BindingSurface::UniFfiBackend(_)
+                )
+            {
+                // An explicit export list keeps ambient helper declarations
+                // module-private, including unlisted classes referenced by a
+                // platform signature. Only selected definitions are exported.
+                ts.push_str("\nexport {};\n");
+            }
         }
 
         // Generate TypeScript definitions for init functions in web and no-modules modes
@@ -3476,7 +3492,12 @@ if (require('worker_threads').isMainThread) {{
                 String::new()
             } else {
                 // For hidden classes, add export type statement
-                if class.private {
+                if class.private
+                    && matches!(
+                        self.config.selected_binding_surface(),
+                        BindingSurface::Public
+                    )
+                {
                     ts_dst.push_str(&format!("export type {{ {identifier} }};\n"));
                 }
                 ts_dst
@@ -3798,13 +3819,26 @@ if (require('worker_threads').isMainThread) {{
             "output stream close hook",
         )?;
 
-        // The backend owns the complete generated surface.  Hide every raw
-        // wasm-bindgen API definition, including an accidentally unlisted one,
-        // and reject namespaces because they cannot be represented by the
-        // dense operation table without reintroducing a public API tree.
+        for name in config.platform_exports() {
+            let entry = self.exports.get(name).with_context(|| {
+                format!("UniFFI platform export references missing raw export `{name}`")
+            })?;
+            let ExportEntry::Definition(definition) = entry else {
+                bail!("UniFFI platform export `{name}` must be a flat definition");
+            };
+            if definition.private || definition.definition.is_empty() {
+                bail!("UniFFI platform export `{name}` must be a public local definition");
+            }
+        }
+
+        // Platform definitions are the only opt-in exception to the private
+        // raw surface. Keep the existing namespace rejection: selecting a
+        // namespace must not reopen an arbitrary public API tree.
         for (name, entry) in &mut self.exports {
             match entry {
-                ExportEntry::Definition(definition) => definition.private = true,
+                ExportEntry::Definition(definition) => {
+                    definition.private = !config.platform_exports().contains(name);
+                }
                 ExportEntry::Namespace(_) => {
                     bail!("UniFFI backend surface does not accept namespace export `{name}`")
                 }
@@ -7659,11 +7693,18 @@ addToLibrary({
             };
 
             self.typescript.push_str(&docs);
-            self.typescript.push_str(if string_enum.private {
-                "\ntype "
-            } else {
-                "\nexport type "
-            });
+            self.typescript.push_str(
+                if string_enum.private
+                    || matches!(
+                        self.config.selected_binding_surface(),
+                        BindingSurface::UniFfiBackend(_)
+                    )
+                {
+                    "\ntype "
+                } else {
+                    "\nexport type "
+                },
+            );
             self.typescript.push_str(&string_enum.name);
             self.typescript.push_str(" = ");
             self.typescript.push_str(&type_expr);
@@ -7759,11 +7800,18 @@ addToLibrary({
                 .collect();
             let docs = format_doc_comments(&dynamic_union.comments, None);
             self.typescript.push_str(&docs);
-            self.typescript.push_str(if dynamic_union.private {
-                "type "
-            } else {
-                "export type "
-            });
+            self.typescript.push_str(
+                if dynamic_union.private
+                    || matches!(
+                        self.config.selected_binding_surface(),
+                        BindingSurface::UniFfiBackend(_)
+                    )
+                {
+                    "type "
+                } else {
+                    "export type "
+                },
+            );
             self.typescript.push_str(&dynamic_union.name);
             self.typescript.push_str(" = ");
             self.typescript.push_str(&rendered.join(" | "));
@@ -8732,6 +8780,92 @@ mod uniffi_surface_tests {
         UniFfiBackendConfig, UniFfiBackendOperation, UniFfiBackendOperationKind,
         UniFfiBackendResourceExports,
     };
+
+    fn platform_config(exports: &[&str]) -> Bindgen {
+        let backend = UniFfiBackendConfig::new(
+            "__uniffi_backend_factory",
+            Vec::new(),
+            UniFfiBackendResourceExports::default(),
+            ClosePolicy {
+                grace_ms: 5_000,
+                on_deadline: DeadlineAction::Detach,
+            },
+        )
+        .unwrap()
+        .with_platform_exports(exports.iter().map(|name| (*name).to_owned()))
+        .unwrap();
+        let mut config = Bindgen::new();
+        config
+            .typescript(true)
+            .binding_surface(BindingSurface::UniFfiBackend(backend));
+        config
+    }
+
+    fn raw_function(name: &str) -> ExportEntry {
+        ExportEntry::Definition(ExportDefinition {
+            identifier: name.to_owned(),
+            comments: None,
+            definition: format!("function {name}(value) {{ return value; }}\n"),
+            ts_comments: None,
+            ts_definition: format!("function {name}(value: number): number;\n"),
+            private: false,
+            parent_identifier: None,
+        })
+    }
+
+    #[test]
+    fn platform_selection_keeps_unlisted_definitions_private() {
+        let config = platform_config(&["platform_value"]);
+        let mut module = Module::default();
+        let wit = NonstandardWitSection::default();
+        let aux = WasmBindgenAux::default();
+        let mut cx = Context::new(&mut module, &config, &wit, &aux).unwrap();
+        for name in ["platform_value", "unlisted_value"] {
+            cx.exports.insert(name.to_owned(), raw_function(name));
+        }
+        cx.write_exports().unwrap();
+        assert!(cx.globals.contains("export function platform_value"));
+        assert!(!cx.globals.contains("export function unlisted_value"));
+        assert!(cx.typescript.contains("export function platform_value"));
+        assert!(!cx.typescript.contains("export function unlisted_value"));
+        assert_eq!(
+            cx.export_name_list,
+            ["__uniffi_backend_factory", "platform_value"]
+        );
+    }
+
+    #[test]
+    fn platform_selection_requires_existing_public_definitions() {
+        for kind in ["missing", "namespace", "private"] {
+            let config = platform_config(&["platform_value"]);
+            let mut module = Module::default();
+            let wit = NonstandardWitSection::default();
+            let aux = WasmBindgenAux::default();
+            let mut cx = Context::new(&mut module, &config, &wit, &aux).unwrap();
+            match kind {
+                "namespace" => {
+                    cx.exports.insert(
+                        "platform_value".to_owned(),
+                        ExportEntry::Namespace(ExportedNamespace::default()),
+                    );
+                }
+                "private" => {
+                    let ExportEntry::Definition(mut definition) = raw_function("platform_value")
+                    else {
+                        unreachable!();
+                    };
+                    definition.private = true;
+                    cx.exports.insert(
+                        "platform_value".to_owned(),
+                        ExportEntry::Definition(definition),
+                    );
+                }
+                _ => {}
+            }
+            let error = cx.write_exports().unwrap_err();
+            assert!(error.to_string().contains("platform_value"), "{error}");
+        }
+    }
 
     #[test]
     fn raw_operations_are_private_and_only_factory_is_exported() {

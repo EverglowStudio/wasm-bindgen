@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Error};
 use serde::Serialize;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::mem;
@@ -479,6 +479,7 @@ pub struct UniFfiBackendConfig {
     operations: Vec<UniFfiBackendOperation>,
     resource_exports: UniFfiBackendResourceExports,
     close_policy: ClosePolicy,
+    platform_exports: BTreeSet<String>,
 }
 
 impl UniFfiBackendConfig {
@@ -552,7 +553,41 @@ impl UniFfiBackendConfig {
             operations,
             resource_exports,
             close_policy,
+            platform_exports: BTreeSet::new(),
         })
+    }
+
+    /// Replace the explicit set of raw platform definitions exposed alongside
+    /// the backend factory. Names refer to top-level JavaScript exports.
+    ///
+    /// Existence and definition visibility are checked during generation;
+    /// backend operation and resource-hook names may never be made public.
+    pub fn with_platform_exports(
+        mut self,
+        exports: impl IntoIterator<Item = String>,
+    ) -> Result<Self, Error> {
+        let exports = exports.into_iter().collect::<BTreeSet<_>>();
+        for name in &exports {
+            if !is_valid_ident(name) {
+                bail!("UniFFI platform export `{name}` is not a JavaScript identifier");
+            }
+            if name == self.factory_export_name()
+                || self
+                    .operations()
+                    .iter()
+                    .any(|operation| operation.raw_export_name() == name)
+                || self.resource_exports().release_object_export_name() == Some(name.as_str())
+                || self.resource_exports().close_output_stream_export_name() == Some(name.as_str())
+            {
+                bail!("UniFFI platform export `{name}` collides with a backend export");
+            }
+        }
+        self.platform_exports = exports;
+        Ok(self)
+    }
+
+    pub fn platform_exports(&self) -> &BTreeSet<String> {
+        &self.platform_exports
     }
 
     pub fn factory_export_name(&self) -> &str {
@@ -1158,7 +1193,11 @@ impl Bindgen {
     }
 
     pub(crate) fn typescript_enabled(&self) -> bool {
-        self.typescript && matches!(self.binding_surface, BindingSurface::Public)
+        self.typescript
+            && match &self.binding_surface {
+                BindingSurface::Public => true,
+                BindingSurface::UniFfiBackend(config) => !config.platform_exports().is_empty(),
+            }
     }
 
     pub fn omit_imports(&mut self, omit_imports: bool) -> &mut Bindgen {
@@ -1898,7 +1937,70 @@ mod uniffi_surface_api_tests {
                 BindingSurface::UniFfiBackend(_)
             ));
             assert!(!bindgen.typescript_enabled());
+
+            let BindingSurface::UniFfiBackend(backend) = surface() else {
+                unreachable!();
+            };
+            bindgen.binding_surface(BindingSurface::UniFfiBackend(
+                backend
+                    .with_platform_exports(["PlatformCounter".to_owned()])
+                    .unwrap(),
+            ));
+            assert!(bindgen.typescript_enabled());
+            bindgen.typescript(false);
+            assert!(!bindgen.typescript_enabled());
         }
+    }
+
+    #[test]
+    fn platform_selection_rejects_backend_names_and_replaces_the_allowlist() {
+        let backend = UniFfiBackendConfig::new(
+            "__uniffi_backend_factory",
+            vec![
+                operation(0, "__uniffi_op_0"),
+                operation(1, "__uniffi_host_op")
+                    .with_dispatch(UniFfiBackendDispatch::HostDispatched),
+            ],
+            UniFfiBackendResourceExports::new(
+                Some("__uniffi_release_object".to_owned()),
+                Some("__uniffi_close_output_stream".to_owned()),
+            )
+            .unwrap(),
+            ClosePolicy {
+                grace_ms: 5_000,
+                on_deadline: DeadlineAction::Detach,
+            },
+        )
+        .unwrap();
+        for name in [
+            "__uniffi_backend_factory",
+            "__uniffi_op_0",
+            "__uniffi_host_op",
+            "__uniffi_release_object",
+            "__uniffi_close_output_stream",
+        ] {
+            let error = backend
+                .clone()
+                .with_platform_exports([name.to_owned()])
+                .unwrap_err();
+            assert!(error.to_string().contains("collides"), "{error}");
+        }
+        for name in ["", "not-an-identifier", "9platform"] {
+            let error = backend
+                .clone()
+                .with_platform_exports([name.to_owned()])
+                .unwrap_err();
+            assert!(error.to_string().contains("identifier"), "{error}");
+        }
+        let selected = backend
+            .with_platform_exports(["PlatformCounter".to_owned(), "PlatformCounter".to_owned()])
+            .unwrap();
+        assert_eq!(selected.platform_exports().len(), 1);
+        assert!(selected
+            .with_platform_exports([])
+            .unwrap()
+            .platform_exports()
+            .is_empty());
     }
 
     #[test]

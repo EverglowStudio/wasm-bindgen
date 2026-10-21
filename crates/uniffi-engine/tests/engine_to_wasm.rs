@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 use wasm_bindgen_macro_support::ExpansionContext;
 use wasm_bindgen_uniffi_engine::{
-    PostLinkTarget, RustPath, WasmArgumentBinding, WasmAsyncKind, WasmCallTarget,
+    EngineError, PostLinkTarget, RustPath, WasmArgumentBinding, WasmAsyncKind, WasmCallTarget,
     WasmCallbackContract, WasmCallbackReentrancy, WasmCallbackRetention, WasmCallbackThreading,
     WasmCallbackUseSite, WasmCarrier, WasmConversionRecipe, WasmEnginePlan, WasmEngineResourceHook,
     WasmEngineResourceHooks, WasmOperationKind, WasmOperationOwner, WasmOperationPlan,
@@ -1047,6 +1047,35 @@ fn fixture_source(plan: &WasmEnginePlan) -> String {
         r#"
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen]
+pub struct PlatformCounter {{ value: u32 }}
+
+#[wasm_bindgen]
+impl PlatformCounter {{
+    #[wasm_bindgen(constructor)]
+    pub fn new(value: u32) -> Self {{ Self {{ value }} }}
+    pub fn increment(&mut self) -> u32 {{
+        self.value += 1;
+        self.value
+    }}
+    pub async fn read(&self) -> u32 {{ self.value }}
+    pub fn snapshot(&self) -> UnlistedPlatform {{ UnlistedPlatform {{ value: self.value }} }}
+}}
+
+#[wasm_bindgen]
+pub struct UnlistedPlatform {{ value: u32 }}
+
+#[wasm_bindgen]
+impl UnlistedPlatform {{
+    pub fn read(&self) -> u32 {{ self.value }}
+}}
+
+#[wasm_bindgen]
+pub fn platform_value(value: u32) -> u32 {{ value + 1 }}
+
+#[wasm_bindgen]
+pub fn unlisted_value() -> u32 {{ 99 }}
+
 mod fixture {{
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -1323,6 +1352,12 @@ mod r#type {{
 
 fn build_fixture(temp: &TempDir, plan: &WasmEnginePlan, cargo: &Path, rustc: &Path) -> PathBuf {
     let root = repo_root();
+    // Honor the caller's shared target directory for both the test harness
+    // and its Wasm fixture instead of building a second dependency cache.
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    let target_dir = std::path::absolute(target_dir).unwrap();
     let project = temp.path().join("fixture");
     fs::create_dir_all(project.join("src")).unwrap();
     fs::write(project.join("src/lib.rs"), fixture_source(plan)).unwrap();
@@ -1357,13 +1392,14 @@ js-sys = {{ path = "{}" }}
         .arg("build")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
-        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("CARGO_TARGET_DIR", &target_dir)
         .env("RUSTC", rustc)
         .env("PATH", RESTRICTED_PATH)
         .output()
         .unwrap();
     assert_command_success("fixture cargo build", &output);
-    root.join("target/wasm32-unknown-unknown/debug")
+    target_dir
+        .join("wasm32-unknown-unknown/debug")
         .join(FIXTURE_NAME)
         .with_extension("wasm")
 }
@@ -1412,6 +1448,10 @@ for (const raw of [
     ...Array.from({{ length: 37 }}, (_, index) => `__uniffi_operation_${{index}}`),
     '__uniffi_release_object',
     '__uniffi_close_output_stream',
+    'PlatformCounter',
+    'platform_value',
+    'UnlistedPlatform',
+    'unlisted_value',
 ]) {{
     assert.equal(Object.hasOwn(api, raw), false);
 }}
@@ -1903,6 +1943,138 @@ fn generate_and_run_target(
     assert_command_success(&format!("{target_name} factory runtime"), &result);
 }
 
+fn generate_and_run_platform_target(
+    temp: &TempDir,
+    plan: &WasmEnginePlan,
+    wasm: &Path,
+    target: PostLinkTarget,
+    node: &Path,
+    tsc: &Path,
+) {
+    let target_name = match target {
+        PostLinkTarget::Web => "web-platform",
+        PostLinkTarget::Bundler => "bundler-platform",
+        PostLinkTarget::Node => "node-platform",
+    };
+    let module_name = format!("{FIXTURE_NAME}_platform");
+    let output_dir = temp.path().join(target_name);
+    let output = plan
+        .post_link(wasm, &module_name, target)
+        .with_platform_exports(["PlatformCounter".to_owned(), "platform_value".to_owned()])
+        .unwrap()
+        .run()
+        .unwrap();
+    let typescript = output.typescript().expect("platform declarations");
+    assert!(typescript.contains("export class PlatformCounter"));
+    assert!(typescript.contains("export function platform_value"));
+    output.emit(&output_dir).unwrap();
+    fs::write(
+        output_dir.join("package.json"),
+        if target == PostLinkTarget::Node {
+            r#"{"type":"commonjs"}"#
+        } else {
+            r#"{"type":"module"}"#
+        },
+    )
+    .unwrap();
+
+    let initialize = if target == PostLinkTarget::Web {
+        format!(
+            "import {{ readFileSync }} from 'node:fs';\n\
+             await api.default({{ module_or_path: readFileSync(new URL('./{module_name}_bg.wasm', import.meta.url)) }});"
+        )
+    } else {
+        String::new()
+    };
+    fs::write(
+        output_dir.join("platform.mjs"),
+        format!(
+            r#"
+import assert from 'node:assert/strict';
+import * as api from './{module_name}.js';
+{initialize}
+const counter = new api.PlatformCounter(40);
+assert.equal(counter.increment(), 41);
+assert.equal(await counter.read(), 41);
+const snapshot = counter.snapshot();
+assert.equal(snapshot.read(), 41);
+snapshot.free();
+counter.free();
+assert.equal(api.platform_value(41), 42);
+assert.equal(typeof api.{DEFAULT_BACKEND_FACTORY}, 'function');
+for (const name of [
+    'UnlistedPlatform', 'unlisted_value',
+    '__uniffi_release_object', '__uniffi_close_output_stream',
+    ...Array.from({{ length: 37 }}, (_, index) => `__uniffi_operation_${{index}}`),
+]) {{
+    assert.equal(Object.hasOwn(api, name), false, name);
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let mut command = Command::new(node);
+    if target == PostLinkTarget::Bundler {
+        command.arg("--experimental-wasm-modules");
+    }
+    let result = command
+        .arg("platform.mjs")
+        .current_dir(&output_dir)
+        .env("PATH", RESTRICTED_PATH)
+        .output()
+        .unwrap();
+    assert_command_success(&format!("{target_name} raw platform runtime"), &result);
+
+    fs::write(
+        output_dir.join("platform.ts"),
+        format!(
+            r#"
+import {{ PlatformCounter, platform_value }} from './{module_name}.js';
+const counter = new PlatformCounter(40);
+const value: number = platform_value(counter.increment());
+const pending: Promise<number> = counter.read();
+const snapshot = counter.snapshot();
+const snapshotValue: number = snapshot.read();
+snapshot.free();
+counter.free();
+// @ts-expect-error constructor arguments must retain real wasm-bindgen types
+new PlatformCounter('wrong');
+// @ts-expect-error an unlisted class is only a module-private type dependency
+import {{ UnlistedPlatform }} from './{module_name}.js';
+// @ts-expect-error unlisted functions must not be importable
+import {{ unlisted_value }} from './{module_name}.js';
+// @ts-expect-error operations remain backend-private
+import {{ __uniffi_operation_0 }} from './{module_name}.js';
+// @ts-expect-error object release hooks remain backend-private
+import {{ __uniffi_release_object }} from './{module_name}.js';
+// @ts-expect-error stream hooks remain backend-private
+import {{ __uniffi_close_output_stream }} from './{module_name}.js';
+"#
+        ),
+    )
+    .unwrap();
+    let result = Command::new(node)
+        .arg(tsc)
+        .args([
+            "--noEmit",
+            "--strict",
+            "--target",
+            "ES2022",
+            "--module",
+            "ESNext",
+            "--moduleResolution",
+            "Bundler",
+            "--lib",
+            "ESNext,DOM",
+            "platform.ts",
+        ])
+        .current_dir(&output_dir)
+        .env("PATH", RESTRICTED_PATH)
+        .output()
+        .unwrap();
+    assert_command_success(&format!("{target_name} platform TypeScript"), &result);
+}
+
 #[test]
 fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
     let temp = tempfile::tempdir().unwrap();
@@ -1948,6 +2120,11 @@ fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
     let cargo = tool_path("cargo");
     let rustc = tool_path("rustc");
     let node = tool_path("node");
+    // Resolve before restricting PATH; use an existing compiler, never install
+    // one as a test side effect. An explicit path also supports local packages.
+    let tsc = std::env::var_os("WASM_BINDGEN_TEST_TYPESCRIPT_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tool_path("tsc"));
     let original_path = std::env::var_os("PATH");
     std::env::set_var("PATH", RESTRICTED_PATH);
     let cli_probe = Command::new("/bin/sh")
@@ -1962,12 +2139,34 @@ fn engine_tokens_compile_postlink_and_run_for_every_loader_target() {
 
     let wasm = build_fixture(&temp, &plan, &cargo, &rustc);
 
+    let missing = plan
+        .post_link(&wasm, "missing", PostLinkTarget::Web)
+        .with_platform_exports(["MissingPlatform".to_owned()])
+        .unwrap()
+        .run();
+    assert!(
+        matches!(missing, Err(EngineError::PostLink(message)) if message.contains("MissingPlatform"))
+    );
+    for name in [
+        DEFAULT_BACKEND_FACTORY,
+        "__uniffi_operation_0",
+        "__uniffi_release_object",
+        "__uniffi_close_output_stream",
+    ] {
+        assert!(matches!(
+            plan.post_link(&wasm, "collision", PostLinkTarget::Web)
+                .with_platform_exports([name.to_owned()]),
+            Err(EngineError::Surface(_))
+        ));
+    }
+
     for target in [
         PostLinkTarget::Web,
         PostLinkTarget::Bundler,
         PostLinkTarget::Node,
     ] {
         generate_and_run_target(&temp, &plan, &wasm, target, &node);
+        generate_and_run_platform_target(&temp, &plan, &wasm, target, &node, &tsc);
     }
     if let Some(path) = original_path {
         std::env::set_var("PATH", path);
